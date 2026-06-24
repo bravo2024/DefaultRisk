@@ -239,7 +239,9 @@ def load_german_credit():
     from sklearn.datasets import fetch_openml
     X, y = fetch_openml(data_id=31, return_X_y=True, as_frame=True, parser="auto")
     df = X.copy()
-    df["Class"] = y.astype(int).map({1: 0, 2: 1})
+    y_str = y.astype(str).str.strip()
+    mapping = {"1": 0, "2": 1, "good": 0, "bad": 1}
+    df["Class"] = y_str.map(mapping).astype(int)
     return df
 
 def load_give_me_some_credit_():
@@ -347,7 +349,10 @@ class CreditFeatures(BaseEstimator, TransformerMixin):
         self.scaler_ = StandardScaler()
 
     def fit(self, X, y=None):
-        self.cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+        self.cat_cols = [c for c in X.columns if X[c].nunique() <= 10 and c != "Class"] or []
+        if not self.cat_cols:
+            self.cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+            self.cat_cols = [c for c in self.cat_cols if c in X.columns]
         self.num_cols = [c for c in X.columns if c not in self.cat_cols and c != "Class"]
         for c in self.cat_cols:
             if c in X.columns:
