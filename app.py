@@ -114,6 +114,7 @@ DATASET_REGISTRY = {
         "target_col": "Class", "default_rate": 0.221,
         "type": "Credit card default",
         "fetch_code": "fetch_ucirepo(id=350)",
+        "url": "https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients",
         "desc": (
             "Default of Credit Card Clients dataset. Predicts whether a credit card holder "
             "will default on their payment next month. Features include demographic info "
@@ -128,6 +129,7 @@ DATASET_REGISTRY = {
         "target_col": "Class", "default_rate": 0.30,
         "type": "Credit risk scoring (general, not card-specific)",
         "fetch_code": "fetch_openml(data_id=31)",
+        "url": "https://www.openml.org/d/31",
         "desc": (
             "Statlog German Credit dataset. Classifies borrowers as good (low risk) or bad "
             "(high risk) credit risks based on attributes like account status, credit history, "
@@ -141,6 +143,7 @@ DATASET_REGISTRY = {
         "target_col": "Class", "default_rate": 0.067,
         "type": "Credit default (loan, not card-specific)",
         "fetch_code": "load_give_me_some_credit()",
+        "url": "https://www.kaggle.com/c/GiveMeSomeCredit",
         "desc": (
             "Kaggle Give Me Some Credit dataset. Predicts whether a borrower will experience "
             "serious delinquency within the next 2 years. Features include revolving utilization, "
@@ -155,6 +158,7 @@ DATASET_REGISTRY = {
         "target_col": "Class", "default_rate": 0.20,
         "type": "Credit card default (private label card)",
         "fetch_code": "load_credit_scoring_pakdd()",
+        "url": "https://pakdd.org/archive/pakdd2009/",
         "desc": (
             "PAKDD 2009 Credit Scoring dataset. Predicts default on a private-label credit card "
             "of a major Brazilian retailer. Features include demographic, financial, and "
@@ -168,6 +172,7 @@ DATASET_REGISTRY = {
         "target_col": "Class", "default_rate": 0.44,
         "type": "Credit card application approval (not default)",
         "fetch_code": "fetch_ucirepo(id=27)",
+        "url": "https://archive.ics.uci.edu/dataset/27/credit+approval",
         "desc": (
             "Credit Approval dataset. Classifies credit card applications as approved or rejected. "
             "All attribute names anonymized (A1-A15). Mix of continuous, categorical, and "
@@ -181,6 +186,7 @@ DATASET_REGISTRY = {
         "target_col": "Class", "default_rate": 0.44,
         "type": "Credit card application approval (not default)",
         "fetch_code": "fetch_ucirepo(id=143)",
+        "url": "https://archive.ics.uci.edu/dataset/143/statlog+australian+credit+approval",
         "desc": (
             "Statlog Australian Credit Approval dataset. 6 numerical + 8 categorical attributes, "
             "all anonymized. Part of the European StatLog project. "
@@ -189,37 +195,38 @@ DATASET_REGISTRY = {
     },
 }
 
-HAS_EMPULSE = False
-try:
-    from empulse.datasets import load_give_me_some_credit as _empulse_gmsc
-    from empulse.datasets import load_credit_scoring_pakdd as _empulse_pakdd
-    HAS_EMPULSE = True
-except ImportError:
-    pass
-
-HAS_UCIMLREPO = False
-try:
-    from ucimlrepo import fetch_ucirepo
-    HAS_UCIMLREPO = True
-except ImportError:
-    pass
-
 # ---------------------------------------------------------------------------
-# Dataset loaders
+# Dataset loaders  (all imports done at call time to avoid stale flags)
 # ---------------------------------------------------------------------------
 def load_uci_default():
-    if HAS_UCIMLREPO:
-        try:
-            data = fetch_ucirepo(id=350)
-            df = data.data.features.copy()
-            target = data.data.targets.copy()
-            df["Class"] = target.values.astype(int).ravel()
-            df.columns = [str(c).strip().upper() for c in df.columns]
-            if "CLASS" in df.columns:
-                df = df.rename(columns={"CLASS": "Class"})
-            return df
-        except Exception:
-            pass
+    from sklearn.datasets import fetch_openml
+    try:
+        data = fetch_openml(data_id=42477, as_frame=True, parser="auto")
+        df = data.frame
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        tc = [c for c in df.columns if "DEFAULT" in c.upper()]
+        if tc:
+            df = df.rename(columns={tc[0]: "Class"})
+        elif "CLASS" in df.columns:
+            df = df.rename(columns={"CLASS": "Class"})
+        elif "Y" in df.columns:
+            df = df.rename(columns={"Y": "Class"})
+        df["Class"] = df["Class"].astype(int)
+        return df
+    except Exception:
+        pass
+    try:
+        from ucimlrepo import fetch_ucirepo
+        data = fetch_ucirepo(id=350)
+        df = data.data.features.copy()
+        target = data.data.targets.copy()
+        df["Class"] = target.values.astype(int).ravel()
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        if "CLASS" in df.columns:
+            df = df.rename(columns={"CLASS": "Class"})
+        return df
+    except Exception:
+        pass
     csv_paths = ["default_of_credit_card_clients.csv", "UCI_Credit_Card.csv",
                  "data/default_of_credit_card_clients.csv"]
     for p in csv_paths:
@@ -245,24 +252,21 @@ def load_german_credit():
     return df
 
 def load_give_me_some_credit_():
-    if not HAS_EMPULSE:
-        raise ImportError("empulse package required. Install: pip install empulse")
-    dataset = _empulse_gmsc()
+    from empulse.datasets import load_give_me_some_credit as _gmsc
+    dataset = _gmsc()
     df = dataset.data.copy()
     df["Class"] = dataset.target.astype(int)
     return df
 
 def load_pakdd_credit():
-    if not HAS_EMPULSE:
-        raise ImportError("empulse package required. Install: pip install empulse")
-    dataset = _empulse_pakdd()
+    from empulse.datasets import load_credit_scoring_pakdd as _pakdd
+    dataset = _pakdd()
     df = dataset.data.copy()
     df["Class"] = dataset.target.astype(int)
     return df
 
 def load_credit_approval():
-    if not HAS_UCIMLREPO:
-        raise ImportError("ucimlrepo package required. Install: pip install ucimlrepo")
+    from ucimlrepo import fetch_ucirepo
     data = fetch_ucirepo(id=27)
     df = data.data.features.copy()
     target = data.data.targets.copy()
@@ -271,8 +275,7 @@ def load_credit_approval():
     return df
 
 def load_australian_credit():
-    if not HAS_UCIMLREPO:
-        raise ImportError("ucimlrepo package required. Install: pip install ucimlrepo")
+    from ucimlrepo import fetch_ucirepo
     data = fetch_ucirepo(id=143)
     df = data.data.features.copy()
     target = data.data.targets.copy()
@@ -524,27 +527,33 @@ if selected_ds != st.session_state.dataset_name:
     st.session_state.data_loaded = False
     st.session_state.dataset_error = None
     st.session_state.dataset_name = selected_ds
+    st.session_state._load_attempted = False
     st.rerun()
 
 meta = DATASET_REGISTRY.get(st.session_state.dataset_name)
 if meta:
+    ds_url = meta.get("url", "")
+    url_md = f"[Source]({ds_url})" if ds_url else ""
     st.sidebar.info(
         f"**{st.session_state.dataset_name}**  \n"
         f"{meta['source']}  \n"
         f"{meta['country']} \u00b7 {meta['samples']:,} rows \u00b7 "
         f"{meta['features']} features  \n"
         f"Default rate: {meta['default_rate']:.0%}  \n"
-        f"Type: {meta['type']}"
+        f"Type: {meta['type']}  \n"
+        f"{url_md}"
     )
 
 with st.sidebar.expander("Available Datasets"):
     for name, m in DATASET_REGISTRY.items():
         tick = "\u2705" if name == st.session_state.dataset_name else "\u2022"
+        u = m.get("url", "")
+        url_line = f"\n[Source link]({u})" if u else ""
         st.markdown(f"**{tick} {name}**  ")
         st.caption(
             f"{m['country']} \u00b7 {m['samples']:,} rows \u00b7 {m['features']} features  \n"
             f"{m['type']}  \n"
-            f"Fetch: `{m['fetch_code']}`"
+            f"Fetch: `{m['fetch_code']}`{url_line}"
         )
         st.markdown("---")
 
@@ -610,6 +619,16 @@ st.sidebar.markdown("---")
 
 def auto_load_data():
     """Load default dataset and train models. Called once on startup."""
+    if st.session_state.get("_load_attempted", False):
+        st.error(
+            f"Failed to load {st.session_state.dataset_name}. "
+            "Try selecting a different dataset from the sidebar, "
+            "or upload a custom CSV file."
+        )
+        st.session_state.data_loaded = True
+        st.session_state.df = make_synthetic_data()
+        return
+    st.session_state._load_attempted = True
     ds_name = st.session_state.dataset_name
     with st.status(f"Loading {ds_name}...", expanded=True) as status:
         df = load_data(ds_name)
@@ -635,7 +654,7 @@ def auto_load_data():
             status.update(label="Models trained", state="complete")
         except Exception as e:
             status.update(label=f"Training failed: {e}", state="error")
-            st.session_state.data_loaded = False
+            st.session_state.data_loaded = True
     st.rerun()
 
 # ── Auto-load on first visit or dataset change ────────────────────────
@@ -649,8 +668,12 @@ X_test = st.session_state.X_test
 models = st.session_state.models
 cv_results = st.session_state.cv_results
 
-is_uci = st.session_state.dataset_name in DATASET_REGISTRY and DATASET_REGISTRY[st.session_state.dataset_name]["loader"] == "load_uci_default"
-is_uci = is_uci and all(c in df.columns for c in ["LIMIT_BAL", "SEX", "EDUCATION"])
+is_uci = bool(
+    st.session_state.dataset_name in DATASET_REGISTRY
+    and DATASET_REGISTRY[st.session_state.dataset_name]["loader"] == "load_uci_default"
+    and df is not None
+    and all(c in df.columns for c in ["LIMIT_BAL", "SEX", "EDUCATION"])
+)
 
 if active_tab == tabs[0]:
     st.markdown("<div class='main-header'>Overview \u2014 Credit Risk in Indian Banking</div>",
@@ -690,13 +713,17 @@ if active_tab == tabs[0]:
         total = len(df)
         n_feats = len(df.columns) - 1
         source_name = ds_meta["source"] if ds_meta else "Custom upload"
+        desc_text = ds_meta["desc"] if ds_meta else ""
+        ds_url = ds_meta.get("url", "") if ds_meta else ""
+        url_link = f'<br><a href="{ds_url}" target="_blank">View source \u2197</a>' if ds_url else ""
         st.markdown(
             f'<div class="metric-card">'
             f"<b>{ds_name}</b><br><br>"
             f" Accounts: {total:,}<br>"
             f" Defaults: {defaults_count:,} ({df['Class'].mean():.1%})<br>"
             f" Features: {n_feats}<br>"
-            f" Source: {source_name}"
+            f" Source: {source_name}{url_link}"
+            f"<br><br>{desc_text}"
             f"</div>",
             unsafe_allow_html=True,
         )
