@@ -61,6 +61,9 @@ defaults = {
     "X_test": None,
     "models": None,
     "cv_results": None,
+    "models_selected": ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"],
+    "loading": False,
+    "abort": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -344,6 +347,32 @@ def make_synthetic_data():
     return df
 
 
+MODEL_SPECS = {
+    "Logistic Regression": {
+        "pipe": lambda: Pipeline([
+            ("features", CreditFeatures()),
+            ("clf", LogisticRegression(class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE)),
+        ]),
+    },
+    "Random Forest": {
+        "pipe": lambda: Pipeline([
+            ("features", CreditFeatures()),
+            ("clf", RandomForestClassifier(class_weight="balanced", n_estimators=100, n_jobs=-1, random_state=RANDOM_STATE)),
+        ]),
+    },
+    "LightGBM (Calibrated)": {
+        "pipe": lambda: Pipeline([
+            ("features", CreditFeatures()),
+            ("clf", lgb.LGBMClassifier(
+                class_weight="balanced", n_estimators=150, learning_rate=0.05,
+                num_leaves=31, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1
+            )),
+        ]),
+        "calibrate": True,
+    },
+}
+
+
 class CreditFeatures(BaseEstimator, TransformerMixin):
     """Encode categorical features and scale numeric ones. Fit on training data only."""
 
@@ -352,10 +381,10 @@ class CreditFeatures(BaseEstimator, TransformerMixin):
         self.scaler_ = StandardScaler()
 
     def fit(self, X, y=None):
-        self.cat_cols = [c for c in X.columns if X[c].nunique() <= 10 and c != "Class"] or []
-        if not self.cat_cols:
-            self.cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
-            self.cat_cols = [c for c in self.cat_cols if c in X.columns]
+        self.cat_cols = [c for c in X.columns if X[c].dtype == "object" and c != "Class"]
+        for c in ["SEX", "EDUCATION", "MARRIAGE"]:
+            if c in X.columns and c not in self.cat_cols:
+                self.cat_cols.append(c)
         self.num_cols = [c for c in X.columns if c not in self.cat_cols and c != "Class"]
         for c in self.cat_cols:
             if c in X.columns:
@@ -382,8 +411,12 @@ class CreditFeatures(BaseEstimator, TransformerMixin):
         return pd.concat(parts, axis=1)
 
 
-def train_and_evaluate(_df):
-    """Run full benchmark: LR, RF, LGBM. Return results dict."""
+def train_and_evaluate(_df, selected_models=None, progress_bar=None, status_text=None):
+    """Run benchmark on selected models. Return results dict or None on abort."""
+    N_FOLDS = 3
+    if selected_models is None:
+        selected_models = list(MODEL_SPECS.keys())
+
     X_all = _df.drop(columns=["Class"])
     y_all = _df["Class"]
 
@@ -394,94 +427,77 @@ def train_and_evaluate(_df):
     results = {"X_train": X_train, "X_test": X_test, "y_train": y_train, "y_test": y_test}
     models = {}
 
-    lr_pipe = Pipeline([
-        ("features", CreditFeatures()),
-        ("clf", LogisticRegression(class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE)),
-    ])
-    lr_pipe.fit(X_train, y_train)
-    lr_proba = lr_pipe.predict_proba(X_test)[:, 1]
-    lr_pred = (lr_proba >= 0.5).astype(int)
-    models["Logistic Regression"] = {
-        "pipeline": lr_pipe, "proba": lr_proba, "pred": lr_pred,
-        "pr_auc": average_precision_score(y_test, lr_proba),
-        "roc_auc": roc_auc_score(y_test, lr_proba),
-    }
+    active = [m for m in selected_models if m in MODEL_SPECS]
+    if "LightGBM (Calibrated)" in active and not HAS_LGB:
+        active.remove("LightGBM (Calibrated)")
 
-    rf_pipe = Pipeline([
-        ("features", CreditFeatures()),
-        ("clf", RandomForestClassifier(
-            class_weight="balanced", n_estimators=200, n_jobs=-1, random_state=RANDOM_STATE
-        )),
-    ])
-    rf_pipe.fit(X_train, y_train)
-    rf_proba = rf_pipe.predict_proba(X_test)[:, 1]
-    rf_pred = (rf_proba >= 0.5).astype(int)
-    models["Random Forest"] = {
-        "pipeline": rf_pipe, "proba": rf_proba, "pred": rf_pred,
-        "pr_auc": average_precision_score(y_test, rf_proba),
-        "roc_auc": roc_auc_score(y_test, rf_proba),
-    }
+    total_steps = len(active) * (1 + N_FOLDS)
+    step = 0
 
-    if HAS_LGB:
-        lgb_base = Pipeline([
-            ("features", CreditFeatures()),
-            ("clf", lgb.LGBMClassifier(
-                class_weight="balanced", n_estimators=300, learning_rate=0.05,
-                num_leaves=31, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1
-            )),
-        ])
-        lgb_calib = CalibratedClassifierCV(estimator=lgb_base, method="isotonic", cv=3)
-        lgb_calib.fit(X_train, y_train)
-        lgb_proba = lgb_calib.predict_proba(X_test)[:, 1]
-        lgb_pred = (lgb_proba >= 0.5).astype(int)
-        models["LightGBM (Calibrated)"] = {
-            "pipeline": lgb_calib, "proba": lgb_proba, "pred": lgb_pred,
-            "pr_auc": average_precision_score(y_test, lgb_proba),
-            "roc_auc": roc_auc_score(y_test, lgb_proba),
+    def check_abort():
+        if st.session_state.get("abort", False):
+            st.session_state.abort = False
+            st.session_state.loading = False
+            st.warning("Training cancelled.")
+            return True
+        return False
+
+    for name in active:
+        if check_abort():
+            return None
+
+        spec = MODEL_SPECS[name]
+        if status_text:
+            status_text.text(f"Fitting {name}…")
+        if progress_bar:
+            progress_bar.progress(step / max(total_steps, 1))
+
+        pipe = spec["pipe"]()
+        if spec.get("calibrate"):
+            calib = CalibratedClassifierCV(estimator=pipe, method="isotonic", cv=3)
+            calib.fit(X_train, y_train)
+            proba = calib.predict_proba(X_test)[:, 1]
+            pred = (proba >= 0.5).astype(int)
+            pipe_saved = calib
+        else:
+            pipe.fit(X_train, y_train)
+            proba = pipe.predict_proba(X_test)[:, 1]
+            pred = (proba >= 0.5).astype(int)
+            pipe_saved = pipe
+
+        models[name] = {
+            "pipeline": pipe_saved, "proba": proba, "pred": pred,
+            "pr_auc": average_precision_score(y_test, proba),
+            "roc_auc": roc_auc_score(y_test, proba),
         }
-    else:
-        models["LightGBM (Calibrated)"] = {
-            "pipeline": None, "proba": None, "pred": None, "pr_auc": 0, "roc_auc": 0,
-        }
+        step += 1
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     cv_results = {}
 
-    for name, pipe_builder, model_cls in [
-        ("Logistic Regression",
-         lambda: LogisticRegression(class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE),
-         None),
-        ("Random Forest",
-         lambda: RandomForestClassifier(class_weight="balanced", n_estimators=200, n_jobs=-1, random_state=RANDOM_STATE),
-         None),
-    ]:
+    for name in active:
+        spec = MODEL_SPECS[name]
         fold_scores = []
-        for tr, va in skf.split(X_train, y_train):
-            p = Pipeline([
-                ("features", CreditFeatures()),
-                ("clf", model_cls() if model_cls else pipe_builder()),
-            ])
+        for fold_i, (tr, va) in enumerate(skf.split(X_train, y_train)):
+            if check_abort():
+                return None
+
+            if status_text:
+                status_text.text(f"Cross-val: {name} — fold {fold_i + 1}/{N_FOLDS}")
+            if progress_bar:
+                progress_bar.progress(step / max(total_steps, 1))
+
+            p = spec["pipe"]()
             p.fit(X_train.iloc[tr], y_train.iloc[tr])
             proba = p.predict_proba(X_train.iloc[va])[:, 1]
             fold_scores.append(average_precision_score(y_train.iloc[va], proba))
-        cv_results[name] = {"mean": float(np.mean(fold_scores)), "std": float(np.std(fold_scores)),
-                           "folds": [float(s) for s in fold_scores]}
+            step += 1
 
-    if HAS_LGB:
-        lgb_folds = []
-        for tr, va in skf.split(X_train, y_train):
-            p = Pipeline([
-                ("features", CreditFeatures()),
-                ("clf", lgb.LGBMClassifier(
-                    class_weight="balanced", n_estimators=300, learning_rate=0.05,
-                    num_leaves=31, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1
-                )),
-            ])
-            p.fit(X_train.iloc[tr], y_train.iloc[tr])
-            proba = p.predict_proba(X_train.iloc[va])[:, 1]
-            lgb_folds.append(average_precision_score(y_train.iloc[va], proba))
-        cv_results["LightGBM"] = {"mean": float(np.mean(lgb_folds)), "std": float(np.std(lgb_folds)),
-                                  "folds": [float(s) for s in lgb_folds]}
+        cv_results[name] = {
+            "mean": float(np.mean(fold_scores)),
+            "std": float(np.std(fold_scores)),
+            "folds": [float(s) for s in fold_scores],
+        }
 
     results["models"] = models
     results["cv_results"] = cv_results
@@ -543,6 +559,16 @@ if meta:
         f"Type: {meta['type']}  \n"
         f"{url_md}"
     )
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Models to Train")
+model_options = ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"]
+st.sidebar.multiselect(
+    "Select models",
+    model_options,
+    key="models_selected",
+    disabled=st.session_state.get("loading", False),
+)
 
 with st.sidebar.expander("Available Datasets"):
     for name, m in DATASET_REGISTRY.items():
@@ -625,10 +651,20 @@ st.sidebar.markdown("---")
 
 
 def load_and_train():
-    """Load selected dataset and train models. Called on button click."""
+    """Load selected dataset and train selected models. Called on button click."""
+    st.session_state.abort = False
+    st.session_state.loading = True
+    st.rerun()
+
+
+def _do_load_and_train():
+    """Actual load + train, called after rerun so UI shows loading state."""
     ds_name = st.session_state.dataset_name
-    with st.spinner(f"Loading {ds_name}..."):
-        df = load_data(ds_name)
+    status = st.sidebar.empty()
+    progress = st.sidebar.progress(0)
+
+    status.text(f"Loading {ds_name}…")
+    df = load_data(ds_name)
     if df is None:
         st.warning(f"Could not load {ds_name}. Using synthetic demo data.")
         df = make_synthetic_data()
@@ -636,22 +672,37 @@ def load_and_train():
     else:
         st.session_state.dataset_error = None
     st.session_state.df = df
-    with st.spinner("Training models (may take a minute)..."):
-        try:
-            results = train_and_evaluate(df)
-            st.session_state.results = results
-            st.session_state.y_test = results["y_test"]
-            st.session_state.X_test = results["X_test"]
-            st.session_state.models = results["models"]
-            st.session_state.cv_results = results["cv_results"]
-        except Exception as e:
-            st.error(f"Model training failed: {e}")
-            st.session_state.results = None
-            st.session_state.y_test = None
-            st.session_state.X_test = None
-            st.session_state.models = {}
-            st.session_state.cv_results = {}
-    st.session_state.data_loaded = True
+
+    sel = st.session_state.get("models_selected", list(MODEL_SPECS.keys()))
+    if not sel:
+        st.warning("Please select at least one model in the sidebar before training.")
+        st.session_state.loading = False
+        st.rerun()
+        return
+    try:
+        results = train_and_evaluate(df, selected_models=sel, progress_bar=progress, status_text=status)
+        if results is None:
+            st.session_state.loading = False
+            st.session_state.data_loaded = False
+            st.rerun()
+            return
+        st.session_state.results = results
+        st.session_state.y_test = results["y_test"]
+        st.session_state.X_test = results["X_test"]
+        st.session_state.models = results["models"]
+        st.session_state.cv_results = results["cv_results"]
+        st.session_state.data_loaded = True
+    except Exception as e:
+        st.error(f"Model training failed: {e}")
+        st.session_state.results = None
+        st.session_state.y_test = None
+        st.session_state.X_test = None
+        st.session_state.models = None
+        st.session_state.cv_results = None
+    finally:
+        st.session_state.loading = False
+        status.empty()
+        progress.empty()
     st.rerun()
 
 
@@ -661,10 +712,19 @@ def tab_placeholder(tab_name):
     st.markdown(f"<div class='sub-header'>{desc}</div>", unsafe_allow_html=True)
     st.markdown("---")
     ds_name = st.session_state.dataset_name
-    st.info(f"Select a dataset from the sidebar, then click the button below to load **{ds_name}** and train models.")
-    if st.button("Load Dataset & Train Models", type="primary", use_container_width=True):
+    loading = st.session_state.get("loading", False)
+    if loading:
+        st.info(f"Training in progress — **{ds_name}** — see sidebar for progress.")
+    else:
+        st.info(f"Select a dataset from the sidebar, then click the button below to load **{ds_name}** and train models.")
+    btn_label = "Loading\u2026" if loading else "Load Dataset & Train Models"
+    if st.button(btn_label, type="primary", use_container_width=True, disabled=loading):
         load_and_train()
 
+
+# ── Execute training if triggered ──────────────────────────────────────
+if st.session_state.get("loading", False):
+    _do_load_and_train()
 
 # ── Data-load guard ───────────────────────────────────────────────────
 if not st.session_state.data_loaded:
@@ -1092,55 +1152,61 @@ elif active_tab == tabs[3]:
     if not st.session_state.data_loaded:
         tab_placeholder(tabs[3])
         st.stop()
+    if not cv_results or not models:
+        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
+        st.stop()
     st.markdown("<div class='main-header'>Model Benchmarks</div>",
                 unsafe_allow_html=True)
     st.markdown(
-        "<div class='sub-header'>Three classifiers compared using 5-fold stratified cross-validation, "
+        "<div class='sub-header'>Three classifiers compared using 3-fold stratified cross-validation, "
         "hold-out test metrics, confusion matrices, and McNemar\u2019s test.</div>",
         unsafe_allow_html=True,
     )
     st.markdown("---")
 
-    st.markdown("### Cross-Validation (5-Fold Stratified)")
+    st.markdown("### Cross-Validation (3-Fold Stratified)")
     st.markdown("**Primary metric: PR-AUC** \u2014 measures ranking performance on the default class.")
 
-    cv_df = pd.DataFrame({
-        name: {"PR-AUC Mean": v["mean"], "PR-AUC Std": v["std"]}
-        for name, v in cv_results.items()
-    }).T
+    if not cv_results:
+        st.warning("No cross-validation results available. Train at least one model to see CV scores.")
+    else:
+        cv_df = pd.DataFrame({
+            name: {"PR-AUC Mean": v["mean"], "PR-AUC Std": v["std"]}
+            for name, v in cv_results.items()
+        }).T
 
-    best_model = cv_df["PR-AUC Mean"].idxmax()
-    cv_df_styled = cv_df.style.apply(
-        lambda row: ["background: #dbeafe" if row.name == best_model else "" for _ in row],
-        axis=1
-    )
-    st.dataframe(cv_df_styled, use_container_width=True)
+        best_model = cv_df["PR-AUC Mean"].idxmax()
+        cv_df_styled = cv_df.style.apply(
+            lambda row: ["background: #dbeafe" if row.name == best_model else "" for _ in row],
+            axis=1
+        )
+        st.dataframe(cv_df_styled, use_container_width=True)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    x_pos = np.arange(len(cv_results))
-    means = [v["mean"] for v in cv_results.values()]
-    stds = [v["std"] for v in cv_results.values()]
-    colors_bar = ["#22c55e" if n == best_model else "#1a56db" for n in cv_results.keys()]
-    bars = ax.bar(x_pos, means, yerr=stds, color=colors_bar, capsize=6, width=0.55,
-                  edgecolor="white", linewidth=1.2)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(list(cv_results.keys()), rotation=25, ha="right")
-    ax.set_ylabel("PR-AUC")
-    ax.set_title("5-Fold CV: PR-AUC (mean \u00b1 std)", fontweight="bold")
-    ax.set_ylim(0, 1.0)
-    ax.axhline(0.5, color="gray", linestyle="--", alpha=0.4, label="Random baseline")
-    ax.legend(fontsize=9)
-    for bar, mean in zip(bars, means):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.015,
-                f"{mean:.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    st.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        x_pos = np.arange(len(cv_results))
+        means = [v["mean"] for v in cv_results.values()]
+        stds = [v["std"] for v in cv_results.values()]
+        colors_bar = ["#22c55e" if n == best_model else "#1a56db" for n in cv_results.keys()]
+        bars = ax.bar(x_pos, means, yerr=stds, color=colors_bar, capsize=6, width=0.55,
+                      edgecolor="white", linewidth=1.2)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(list(cv_results.keys()), rotation=25, ha="right")
+        ax.set_ylabel("PR-AUC")
+        ax.set_title("3-Fold CV: PR-AUC (mean \u00b1 std)", fontweight="bold")
+        ax.set_ylim(0, 1.0)
+        ax.axhline(0.5, color="gray", linestyle="--", alpha=0.4, label="Random baseline")
+        ax.legend(fontsize=9)
+        for bar, mean in zip(bars, means):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.015,
+                    f"{mean:.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        st.pyplot(fig)
 
-    st.info(
-        f"**{best_model}** achieved the highest CV PR-AUC "
-        f"({cv_results[best_model]['mean']:.4f} \u00b1 {cv_results[best_model]['std']:.4f})."
-    )
+        st.info(
+            f"**{best_model}** achieved the highest CV PR-AUC "
+            f"({cv_results[best_model]['mean']:.4f} \u00b1 {cv_results[best_model]['std']:.4f})."
+        )
     st.markdown("---")
 
     st.markdown("### Hold-Out Test Set")
@@ -1234,6 +1300,9 @@ elif active_tab == tabs[3]:
 elif active_tab == tabs[4]:
     if not st.session_state.data_loaded:
         tab_placeholder(tabs[4])
+        st.stop()
+    if not models:
+        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
         st.stop()
     st.markdown("<div class='main-header'>Scorecard & Decision Threshold</div>",
                 unsafe_allow_html=True)
@@ -1366,6 +1435,9 @@ elif active_tab == tabs[5]:
     if not st.session_state.data_loaded:
         tab_placeholder(tabs[5])
         st.stop()
+    if not models:
+        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
+        st.stop()
     st.markdown("<div class='main-header'>Explainability \u2014 Feature Attribution</div>",
                 unsafe_allow_html=True)
     st.markdown(
@@ -1382,7 +1454,7 @@ elif active_tab == tabs[5]:
         )
         st.markdown("SHAP uses cooperative game theory to attribute feature contributions to individual predictions.")
     else:
-    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
+        best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
 
         X_all = df.drop(columns=["Class"])
         y_all = df["Class"]
@@ -1466,6 +1538,9 @@ elif active_tab == tabs[5]:
 elif active_tab == tabs[6]:
     if not st.session_state.data_loaded:
         tab_placeholder(tabs[6])
+        st.stop()
+    if not models or not cv_results:
+        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
         st.stop()
     st.markdown("<div class='main-header'>Model Card & About</div>",
                 unsafe_allow_html=True)
