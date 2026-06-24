@@ -8,3 +8,5 @@ scipy>=1.10
 plotly>=5.15
 lightgbm>=4.0
 shap>=0.44
+ucimlrepo>=0.0.7
+empulse>=0.11

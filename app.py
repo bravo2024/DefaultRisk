@@ -53,6 +53,8 @@ st.set_page_config(
 
 defaults = {
     "data_loaded": False,
+    "dataset_name": "UCI Credit Card (Taiwan)",
+    "dataset_error": None,
     "df": None,
     "results": None,
     "y_test": None,
@@ -102,67 +104,214 @@ PAY_STATUS_MAP = {-2: "No consumption", -1: "Paid in full", 0: "Revolving", 1: "
                   2: "2 month delay", 3: "3 month delay", 4: "4 month delay", 5: "5+ month delay",
                   6: "6+ month delay", 7: "7+ month delay", 8: "8+ month delay", 9: "9+ month delay"}
 
+# ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
+DATASET_REGISTRY = {
+    "UCI Credit Card (Taiwan)": {
+        "loader": "load_uci_default", "source": "UCI ML Repository (ID 350)",
+        "country": "Taiwan", "year": 2005, "samples": 30000, "features": 23,
+        "target_col": "Class", "default_rate": 0.221,
+        "type": "Credit card default",
+        "fetch_code": "fetch_ucirepo(id=350)",
+        "desc": (
+            "Default of Credit Card Clients dataset. Predicts whether a credit card holder "
+            "will default on their payment next month. Features include demographic info "
+            "(credit limit, gender, education, marital status, age) and 6-month payment history "
+            "(repayment status, bill amounts, payment amounts)."
+        ),
+    },
+    "German Credit (Germany)": {
+        "loader": "load_german_credit",
+        "source": "OpenML (ID 31) / UCI (ID 144)",
+        "country": "Germany", "year": 1994, "samples": 1000, "features": 20,
+        "target_col": "Class", "default_rate": 0.30,
+        "type": "Credit risk scoring (general, not card-specific)",
+        "fetch_code": "fetch_openml(data_id=31)",
+        "desc": (
+            "Statlog German Credit dataset. Classifies borrowers as good (low risk) or bad "
+            "(high risk) credit risks based on attributes like account status, credit history, "
+            "purpose, credit amount, employment status, and personal information."
+        ),
+    },
+    "Give Me Some Credit (USA)": {
+        "loader": "load_give_me_some_credit_",
+        "source": "empulse package (Kaggle Credit Fusion)",
+        "country": "USA", "year": 2011, "samples": 112915, "features": 10,
+        "target_col": "Class", "default_rate": 0.067,
+        "type": "Credit default (loan, not card-specific)",
+        "fetch_code": "load_give_me_some_credit()",
+        "desc": (
+            "Kaggle Give Me Some Credit dataset. Predicts whether a borrower will experience "
+            "serious delinquency within the next 2 years. Features include revolving utilization, "
+            "age, late payments (30-59, 60-89, 90+ days), debt ratio, monthly income, "
+            "open credit lines, real estate loans, and dependents."
+        ),
+    },
+    "PAKDD Credit Scoring (Brazil)": {
+        "loader": "load_pakdd_credit",
+        "source": "empulse package (PAKDD 2009)",
+        "country": "Brazil", "year": 2009, "samples": 38938, "features": 25,
+        "target_col": "Class", "default_rate": 0.20,
+        "type": "Credit card default (private label card)",
+        "fetch_code": "load_credit_scoring_pakdd()",
+        "desc": (
+            "PAKDD 2009 Credit Scoring dataset. Predicts default on a private-label credit card "
+            "of a major Brazilian retailer. Features include demographic, financial, and "
+            "behavioral variables from 2003-2008."
+        ),
+    },
+    "Credit Approval (Confidential)": {
+        "loader": "load_credit_approval",
+        "source": "UCI ML Repository (ID 27)",
+        "country": "Confidential", "year": 1992, "samples": 690, "features": 15,
+        "target_col": "Class", "default_rate": 0.44,
+        "type": "Credit card application approval (not default)",
+        "fetch_code": "fetch_ucirepo(id=27)",
+        "desc": (
+            "Credit Approval dataset. Classifies credit card applications as approved or rejected. "
+            "All attribute names anonymized (A1-A15). Mix of continuous, categorical, and "
+            "missing values. Note: this is about application approval, not default prediction."
+        ),
+    },
+    "Australian Credit (Australia)": {
+        "loader": "load_australian_credit",
+        "source": "UCI ML Repository (ID 143)",
+        "country": "Australia", "year": 1990, "samples": 690, "features": 14,
+        "target_col": "Class", "default_rate": 0.44,
+        "type": "Credit card application approval (not default)",
+        "fetch_code": "fetch_ucirepo(id=143)",
+        "desc": (
+            "Statlog Australian Credit Approval dataset. 6 numerical + 8 categorical attributes, "
+            "all anonymized. Part of the European StatLog project. "
+            "Note: this is about application approval, not default prediction."
+        ),
+    },
+}
 
-def load_data():
-    """Load UCI Default of Credit Card Clients dataset with fallbacks."""
-    from sklearn.datasets import fetch_openml
+HAS_EMPULSE = False
+try:
+    from empulse.datasets import load_give_me_some_credit as _empulse_gmsc
+    from empulse.datasets import load_credit_scoring_pakdd as _empulse_pakdd
+    HAS_EMPULSE = True
+except ImportError:
+    pass
 
-    try:
-        data = fetch_openml(data_id=42477, as_frame=True, parser="auto")
-        df = data.frame
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        rename_map = {}
-        for c in df.columns:
-            if c == "DEFAULT.PAYMENT.NEXT.MONTH" or c == "DEFAULT PAYMENT NEXT MONTH" or c == "DEFAULT":
-                rename_map[c] = "Class"
-            elif c == "LIMIT_BAL":
-                rename_map[c] = "LIMIT_BAL"
-            elif c == "SEX":
-                rename_map[c] = "SEX"
-        df = df.rename(columns=rename_map)
-        if "Class" not in df.columns:
-            col_class = [c for c in df.columns if "DEFAULT" in c.upper() or c == "Y"]
-            if col_class:
-                df = df.rename(columns={col_class[0]: "Class"})
-        df["Class"] = df["Class"].astype(int)
-        for c in df.columns:
-            if c not in ["Class"] and c in UCI_FEATURES:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
-    except Exception:
-        pass
+HAS_UCIMLREPO = False
+try:
+    from ucimlrepo import fetch_ucirepo
+    HAS_UCIMLREPO = True
+except ImportError:
+    pass
 
-    try:
-        from ucimlrepo import fetch_ucirepo
-        dataset = fetch_ucirepo(id=350)
-        df = dataset.data.features.copy()
-        target = dataset.data.targets.copy()
-        target_col = target.columns[0]
-        df["Class"] = target[target_col].astype(int)
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        if "CLASS" not in df.columns and "Y" in df.columns:
-            df = df.rename(columns={"Y": "Class"})
-        elif "CLASS" not in df.columns:
-            df["Class"] = target.values.astype(int)
-        return df
-    except Exception:
-        pass
-
+# ---------------------------------------------------------------------------
+# Dataset loaders
+# ---------------------------------------------------------------------------
+def load_uci_default():
+    if HAS_UCIMLREPO:
+        try:
+            data = fetch_ucirepo(id=350)
+            df = data.data.features.copy()
+            target = data.data.targets.copy()
+            df["Class"] = target.values.astype(int).ravel()
+            df.columns = [str(c).strip().upper() for c in df.columns]
+            if "CLASS" not in df.columns:
+                df["Class"] = target.values.astype(int).ravel()
+            return df
+        except Exception:
+            pass
     csv_paths = ["default_of_credit_card_clients.csv", "UCI_Credit_Card.csv",
                  "data/default_of_credit_card_clients.csv"]
     for p in csv_paths:
         if Path(p).exists():
             df = pd.read_csv(p)
             df.columns = [str(c).strip().upper() for c in df.columns]
-            target_col = [c for c in df.columns if "DEFAULT" in c]
-            if target_col:
-                df = df.rename(columns={target_col[0]: "Class"})
+            tc = [c for c in df.columns if "DEFAULT" in c]
+            if tc:
+                df = df.rename(columns={tc[0]: "Class"})
             elif "Y" in df.columns:
                 df = df.rename(columns={"Y": "Class"})
             df["Class"] = df["Class"].astype(int)
             return df
+    return None
 
-    st.warning("Could not load UCI dataset. Using synthetic data for demonstration.")
+def load_german_credit():
+    from sklearn.datasets import fetch_openml
+    X, y = fetch_openml(data_id=31, return_X_y=True, as_frame=True, parser="auto")
+    df = X.copy()
+    df["Class"] = y.astype(int).map({1: 0, 2: 1})
+    return df
+
+def load_give_me_some_credit_():
+    if not HAS_EMPULSE:
+        raise ImportError("empulse package required. Install: pip install empulse")
+    dataset = _empulse_gmsc()
+    df = dataset.data.copy()
+    df["Class"] = dataset.target.astype(int)
+    return df
+
+def load_pakdd_credit():
+    if not HAS_EMPULSE:
+        raise ImportError("empulse package required. Install: pip install empulse")
+    dataset = _empulse_pakdd()
+    df = dataset.data.copy()
+    df["Class"] = dataset.target.astype(int)
+    return df
+
+def load_credit_approval():
+    if not HAS_UCIMLREPO:
+        raise ImportError("ucimlrepo package required. Install: pip install ucimlrepo")
+    data = fetch_ucirepo(id=27)
+    df = data.data.features.copy()
+    target = data.data.targets.copy()
+    tc = target.columns[0]
+    df["Class"] = target[tc].map({"+": 0, "-": 1}).astype(int)
+    return df
+
+def load_australian_credit():
+    if not HAS_UCIMLREPO:
+        raise ImportError("ucimlrepo package required. Install: pip install ucimlrepo")
+    data = fetch_ucirepo(id=143)
+    df = data.data.features.copy()
+    target = data.data.targets.copy()
+    tc = target.columns[0]
+    df["Class"] = target[tc].map({1: 0, 2: 1}).astype(int)
+    return df
+
+LOADER_MAP = {
+    "load_uci_default": load_uci_default,
+    "load_german_credit": load_german_credit,
+    "load_give_me_some_credit_": load_give_me_some_credit_,
+    "load_pakdd_credit": load_pakdd_credit,
+    "load_credit_approval": load_credit_approval,
+    "load_australian_credit": load_australian_credit,
+}
+
+
+def load_data(dataset_name):
+    """Load dataset by name from the registry."""
+    if dataset_name not in DATASET_REGISTRY:
+        return None
+    loader_name = DATASET_REGISTRY[dataset_name]["loader"]
+    fn = LOADER_MAP.get(loader_name)
+    if fn is None:
+        return None
+    try:
+        df = fn()
+        if df is None:
+            return None
+        for c in df.columns:
+            if c != "Class":
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["Class"] = df["Class"].astype(int)
+        return df
+    except Exception as e:
+        st.warning(f"Failed to load {dataset_name}: {e}")
+        return None
+
+
+def make_synthetic_data():
+    """Generate synthetic credit data as final fallback."""
     rng = np.random.default_rng(RANDOM_STATE)
     n = 5000
     df = pd.DataFrame()
@@ -352,31 +501,89 @@ _tab_descriptions = {
 }
 
 
-def tab_placeholder(tab_name):
-    desc = _tab_descriptions.get(tab_name, "DefaultRisk analysis dashboard.")
-    st.markdown(f"<div class='main-header'>{tab_name}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='sub-header'>{desc}</div>", unsafe_allow_html=True)
-    st.markdown("---")
-    st.info("Load the dataset to view interactive charts, model metrics, and analysis.")
-    if st.button("Load Dataset & Train Models", type="primary", use_container_width=True):
-        with st.spinner("Loading UCI Credit Card dataset..."):
-            st.session_state.df = load_data()
-        with st.spinner("Training models (may take a minute)..."):
-            st.session_state.results = train_and_evaluate(st.session_state.df)
-        st.session_state.y_test = st.session_state.results["y_test"]
-        st.session_state.X_test = st.session_state.results["X_test"]
-        st.session_state.models = st.session_state.results["models"]
-        st.session_state.cv_results = st.session_state.results["cv_results"]
-        st.session_state.data_loaded = True
-        st.rerun()
-
-
+# ── Sidebar ──────────────────────────────────────────────────────────────────────
 st.sidebar.markdown(
     "<h1 style='font-size:1.6rem; margin-bottom:0;'>\U0001f3e6 DefaultRisk</h1>",
     unsafe_allow_html=True,
 )
-st.sidebar.caption("Credit card default PD model  \u00b7  Indian Banking Context")
+st.sidebar.caption("Credit default PD model  \u00b7  Indian Banking Context")
 st.sidebar.markdown("---")
+
+ds_options = list(DATASET_REGISTRY.keys())
+default_idx = ds_options.index(st.session_state.dataset_name) if st.session_state.dataset_name in ds_options else 0
+selected_ds = st.sidebar.selectbox("Dataset", ds_options, index=default_idx, key="ds_selector")
+
+if selected_ds != st.session_state.dataset_name:
+    for k in ["df", "results", "y_test", "X_test", "models", "cv_results"]:
+        st.session_state[k] = None
+    st.session_state.data_loaded = False
+    st.session_state.dataset_error = None
+    st.session_state.dataset_name = selected_ds
+    st.rerun()
+
+meta = DATASET_REGISTRY.get(st.session_state.dataset_name)
+if meta:
+    st.sidebar.info(
+        f"**{st.session_state.dataset_name}**  \n"
+        f"{meta['source']}  \n"
+        f"{meta['country']} \u00b7 {meta['samples']:,} rows \u00b7 "
+        f"{meta['features']} features  \n"
+        f"Default rate: {meta['default_rate']:.0%}  \n"
+        f"Type: {meta['type']}"
+    )
+
+with st.sidebar.expander("Available Datasets"):
+    for name, m in DATASET_REGISTRY.items():
+        tick = "\u2705" if name == st.session_state.dataset_name else "\u2022"
+        st.markdown(f"**{tick} {name}**  ")
+        st.caption(
+            f"{m['country']} \u00b7 {m['samples']:,} rows \u00b7 {m['features']} features  \n"
+            f"{m['type']}  \n"
+            f"Fetch: `{m['fetch_code']}`"
+        )
+        st.markdown("---")
+
+with st.sidebar.expander("Upload Custom Data"):
+    uploaded = st.file_uploader("CSV file", type=["csv"], key="custom_csv")
+    if uploaded is not None:
+        try:
+            df_upload = pd.read_csv(uploaded)
+            if "Class" not in df_upload.columns:
+                possible = [c for c in df_upload.columns if "default" in c.lower() or "target" in c.lower() or "class" in c.lower()]
+                if possible:
+                    df_upload = df_upload.rename(columns={possible[0]: "Class"})
+                else:
+                    st.error("CSV must contain a 'Class' column (or default/target/class).")
+                    df_upload = None
+            if df_upload is not None:
+                df_upload["Class"] = df_upload["Class"].astype(int)
+                st.session_state.df = df_upload
+                st.session_state.dataset_name = "Custom Upload"
+                st.session_state.data_loaded = False
+                st.rerun()
+        except Exception as e:
+            st.error(f"Error reading CSV: {e}")
+
+    url = st.text_input("URL (raw CSV)", placeholder="https://example.com/data.csv")
+    if st.button("Load from URL", key="load_url"):
+        if url:
+            try:
+                df_url = pd.read_csv(url)
+                if "Class" not in df_url.columns:
+                    possible = [c for c in df_url.columns if "default" in c.lower() or "target" in c.lower() or "class" in c.lower()]
+                    if possible:
+                        df_url = df_url.rename(columns={possible[0]: "Class"})
+                    else:
+                        st.error("CSV must contain a 'Class' column.")
+                        df_url = None
+                if df_url is not None:
+                    df_url["Class"] = df_url["Class"].astype(int)
+                    st.session_state.df = df_url
+                    st.session_state.dataset_name = "URL Import"
+                    st.session_state.data_loaded = False
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error loading URL: {e}")
 
 tabs = [
     "Overview",
@@ -387,24 +594,48 @@ tabs = [
     "Explainability",
     "Model Card & About",
 ]
-active_tab = st.sidebar.radio("Go to", tabs, index=0)
+active_tab = st.sidebar.radio("Go to", tabs, index=(
+    tabs.index(st.session_state.get("_last_tab", tabs[0]))
+    if st.session_state.get("_last_tab") in tabs else 0
+), key="tab_nav")
+st.session_state._last_tab = active_tab
 
 st.sidebar.markdown("---")
-st.sidebar.info(
-    "Dataset: UCI Default of Credit Card Clients  \n"
-    "30,000 accounts  \u00b7  22% default rate  \n"
-    "23 features (demographics + payment history)"
-)
 
+
+def auto_load_data():
+    """Load default dataset and train models. Called once on startup."""
+    ds_name = st.session_state.dataset_name
+    with st.status(f"Loading {ds_name}...", expanded=True) as status:
+        df = load_data(ds_name)
+        if df is not None:
+            status.update(label=f"{ds_name} loaded ({len(df):,} rows)", state="complete")
+            st.session_state.df = df
+            st.session_state.dataset_error = None
+        else:
+            status.update(label="Dataset unavailable — using synthetic data", state="error")
+            df = make_synthetic_data()
+            st.session_state.df = df
+            st.session_state.dataset_error = f"Could not load {ds_name}. Using synthetic demo data."
+
+    with st.status("Training models...", expanded=True) as status:
+        try:
+            results = train_and_evaluate(df)
+            st.session_state.results = results
+            st.session_state.y_test = results["y_test"]
+            st.session_state.X_test = results["X_test"]
+            st.session_state.models = results["models"]
+            st.session_state.cv_results = results["cv_results"]
+            st.session_state.data_loaded = True
+            status.update(label="Models trained", state="complete")
+        except Exception as e:
+            status.update(label=f"Training failed: {e}", state="error")
+            st.session_state.data_loaded = False
+    st.rerun()
+
+# ── Auto-load on first visit or dataset change ────────────────────────
 if not st.session_state.data_loaded:
-    st.markdown(
-        "<div style='background:#f0f7ff; border:1px solid #bdd3eb; border-radius:10px; "
-        "padding:1rem 1.5rem; margin-bottom:1rem;'>"
-        "<b>\U0001f3e6 DefaultRisk</b> \u2014 Click <b>Load Dataset</b> on any tab to load the "
-        "UCI Credit Card dataset (adapted for Indian context) and train models. "
-        "Each tab shows a description of the analysis it contains.</div>",
-        unsafe_allow_html=True,
-    )
+    auto_load_data()
 
 df = st.session_state.df
 results = st.session_state.results
@@ -413,10 +644,10 @@ X_test = st.session_state.X_test
 models = st.session_state.models
 cv_results = st.session_state.cv_results
 
+is_uci = st.session_state.dataset_name in DATASET_REGISTRY and DATASET_REGISTRY[st.session_state.dataset_name]["loader"] == "load_uci_default"
+is_uci = is_uci and all(c in df.columns for c in ["LIMIT_BAL", "SEX", "EDUCATION"])
+
 if active_tab == tabs[0]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[0])
-        st.stop()
     st.markdown("<div class='main-header'>Overview \u2014 Credit Risk in Indian Banking</div>",
                 unsafe_allow_html=True)
     st.markdown(
@@ -448,15 +679,19 @@ if active_tab == tabs[0]:
 
     with col2:
         st.markdown("###  Dataset Summary")
+        ds_name = st.session_state.dataset_name
+        ds_meta = DATASET_REGISTRY.get(ds_name)
         defaults_count = int(df["Class"].sum())
         total = len(df)
+        n_feats = len(df.columns) - 1
+        source_name = ds_meta["source"] if ds_meta else "Custom upload"
         st.markdown(
             f'<div class="metric-card">'
-            f"<b>UCI Default of Credit Card Clients</b><br><br>"
+            f"<b>{ds_name}</b><br><br>"
             f" Accounts: {total:,}<br>"
             f" Defaults: {defaults_count:,} ({df['Class'].mean():.1%})<br>"
-            f" Features: 23 (demographics + 6-month payment history)<br>"
-            f" Source: UCI ML Repository (adapted for Indian context)"
+            f" Features: {n_feats}<br>"
+            f" Source: {source_name}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -472,8 +707,8 @@ if active_tab == tabs[0]:
         st.metric("Accounts", f"{total:,}",
                   help="Total observations in dataset")
     with c3:
-        st.metric("Features", "23",
-                  help="Demographics + 6-month payment/bill history")
+        st.metric("Features", f"{n_feats}",
+                  help="Number of feature columns in the dataset")
     with c4:
         st.metric("Regulatory Standard", "RBI Basel III",
                   help="IRB approach for PD estimation")
@@ -506,19 +741,26 @@ if active_tab == tabs[0]:
 
 elif active_tab == tabs[1]:
     if not st.session_state.data_loaded:
-        tab_placeholder(tabs[1])
+        st.error("Data loading failed. Select a different dataset from the sidebar.")
         st.stop()
-    st.markdown("<div class='main-header'>Data Explorer \u2014 Credit Card Default Dataset</div>",
+
+    ds_name = st.session_state.dataset_name
+    st.markdown(f"<div class='main-header'>Data Explorer \u2014 {ds_name}</div>",
                 unsafe_allow_html=True)
     st.markdown(
-        "<div class='sub-header'>Default rate distributions, demographic patterns, payment history analysis, and feature correlations.</div>",
+        "<div class='sub-header'>Target distribution, feature analysis, and correlations.</div>",
         unsafe_allow_html=True,
     )
     st.markdown("---")
 
-    eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs([
-        "Default Distribution", "Demographics", "Payment History", "Correlations"
-    ])
+    if is_uci:
+        eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs([
+            "Default Distribution", "Demographics", "Payment History", "Correlations"
+        ])
+    else:
+        eda_tab1, eda_tab2 = st.tabs([
+            "Default Distribution", "Feature Analysis"
+        ])
 
     with eda_tab1:
         st.markdown("#### Target Distribution \u2014 Default vs Non-Default")
@@ -526,14 +768,15 @@ elif active_tab == tabs[1]:
         with col_chart:
             fig, ax = plt.subplots(figsize=(8, 4.5))
             counts = df["Class"].value_counts()
-            bars = ax.bar(["Non-Default (0)", "Default (1)"], counts.values,
+            labels_map = {0: "Non-Default (0)", 1: "Default (1)"}
+            bars = ax.bar([labels_map.get(i, str(i)) for i in counts.index], counts.values,
                           color=["#1a56db", "#ef4444"], width=0.5, edgecolor="white")
             for bar, val in zip(bars, counts.values):
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 200,
                         f"{val:,} ({val/len(df):.1%})", ha="center", va="bottom",
                         fontsize=11, fontweight="bold")
             ax.set_ylabel("Count")
-            ax.set_title("Credit Card Default Distribution", fontweight="bold")
+            ax.set_title(f"Target Distribution ({ds_name})", fontweight="bold")
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             st.pyplot(fig)
@@ -542,164 +785,201 @@ elif active_tab == tabs[1]:
             st.markdown(
                 f'<div class="metric-card">'
                 f"<b>Key Stats</b><br><br>"
-                f"Non-Default: {counts[0]:,}<br>"
-                f"Default:  {counts[1]:,}<br>"
+                f"Non-Default: {counts.get(0, 0):,}<br>"
+                f"Default:  {counts.get(1, 0):,}<br>"
                 f"Default Rate: {df['Class'].mean():.1%}<br>"
                 f"Total: {len(df):,}<br>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
             st.markdown(
-                "With ~22% default rate, accuracy is not the primary concern "
-                "(a 78% baseline exists). PR-AUC evaluates ranking performance on the default class."
+                f"PR-AUC evaluates ranking performance on the default class "
+                f"(baseline accuracy: {max(df['Class'].mean(), 1-df['Class'].mean()):.0%})."
             )
 
-    with eda_tab2:
-        st.markdown("#### Demographic Analysis")
-        demo_choice = st.selectbox("Select demographic feature",
-                                   ["SEX", "EDUCATION", "MARRIAGE", "AGE", "LIMIT_BAL"])
+    if is_uci:
+        with eda_tab2:
+            st.markdown("#### Demographic Analysis")
+            demo_choice = st.selectbox("Select demographic feature",
+                                       ["SEX", "EDUCATION", "MARRIAGE", "AGE", "LIMIT_BAL"])
 
-        if demo_choice == "SEX":
-            df_plot = df.copy()
-            df_plot["SEX"] = df_plot["SEX"].map(SEX_MAP).fillna("Unknown")
-            fig, ax = plt.subplots(figsize=(8, 4.5))
-            default_rates = df_plot.groupby("SEX")["Class"].mean()
-            counts_data = df_plot["SEX"].value_counts()
-            ax.bar(default_rates.index, default_rates.values,
-                   color=["#1a56db", "#ef4444"], edgecolor="white", width=0.4)
-            ax.set_ylabel("Default Rate")
-            ax.set_title("Default Rate by Gender", fontweight="bold")
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            for i, (idx, val) in enumerate(default_rates.items()):
-                ax.text(i, val + 0.005, f"{val:.1%}", ha="center", fontsize=10, fontweight="bold")
-            st.pyplot(fig)
-            st.caption("Sample: " + ", ".join([f"{k}: {v}" for k, v in counts_data.items()]))
+            if demo_choice == "SEX":
+                df_plot = df.copy()
+                df_plot["SEX"] = df_plot["SEX"].map(SEX_MAP).fillna("Unknown")
+                fig, ax = plt.subplots(figsize=(8, 4.5))
+                default_rates = df_plot.groupby("SEX")["Class"].mean()
+                counts_data = df_plot["SEX"].value_counts()
+                ax.bar(default_rates.index, default_rates.values,
+                       color=["#1a56db", "#ef4444"], edgecolor="white", width=0.4)
+                ax.set_ylabel("Default Rate")
+                ax.set_title("Default Rate by Gender", fontweight="bold")
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                for i, (idx, val) in enumerate(default_rates.items()):
+                    ax.text(i, val + 0.005, f"{val:.1%}", ha="center", fontsize=10, fontweight="bold")
+                st.pyplot(fig)
+                st.caption("Sample: " + ", ".join([f"{k}: {v}" for k, v in counts_data.items()]))
 
-        elif demo_choice == "EDUCATION":
-            df_plot = df.copy()
-            df_plot["EDUCATION"] = df_plot["EDUCATION"].map(EDU_MAP).fillna("Unknown")
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            default_rates = df_plot.groupby("EDUCATION")["Class"].mean().sort_values()
-            ax.barh(default_rates.index, default_rates.values,
-                    color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in default_rates.values],
-                    edgecolor="white")
-            ax.axvline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
+            elif demo_choice == "EDUCATION":
+                df_plot = df.copy()
+                df_plot["EDUCATION"] = df_plot["EDUCATION"].map(EDU_MAP).fillna("Unknown")
+                fig, ax = plt.subplots(figsize=(9, 4.5))
+                default_rates = df_plot.groupby("EDUCATION")["Class"].mean().sort_values()
+                ax.barh(default_rates.index, default_rates.values,
+                        color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in default_rates.values],
+                        edgecolor="white")
+                ax.axvline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
+                           label=f"Overall ({df['Class'].mean():.1%})")
+                ax.set_xlabel("Default Rate")
+                ax.set_title("Default Rate by Education Level", fontweight="bold")
+                ax.legend()
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                st.pyplot(fig)
+
+            elif demo_choice == "MARRIAGE":
+                df_plot = df.copy()
+                df_plot["MARRIAGE"] = df_plot["MARRIAGE"].map(MARRIAGE_MAP).fillna("Unknown")
+                fig, ax = plt.subplots(figsize=(8, 4.5))
+                default_rates = df_plot.groupby("MARRIAGE")["Class"].mean()
+                ax.bar(default_rates.index, default_rates.values,
+                       color=["#1a56db", "#ef4444", "#64748b"], edgecolor="white", width=0.4)
+                ax.set_ylabel("Default Rate")
+                ax.set_title("Default Rate by Marital Status", fontweight="bold")
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                for i, (idx, val) in enumerate(default_rates.items()):
+                    ax.text(i, val + 0.005, f"{val:.1%}", ha="center", fontsize=10, fontweight="bold")
+                st.pyplot(fig)
+
+            elif demo_choice == "AGE":
+                fig, ax = plt.subplots(figsize=(9, 4.5))
+                for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
+                    sns.kdeplot(df[df["Class"] == label]["AGE"], ax=ax,
+                                label=name, color=color, fill=True, alpha=0.35)
+                ax.set_xlabel("Age")
+                ax.set_ylabel("Density")
+                ax.set_title("Age Distribution by Default Status", fontweight="bold")
+                ax.legend()
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                st.pyplot(fig)
+                st.caption("Younger borrowers (20\u201330) tend to have slightly higher default rates in this dataset.")
+
+            elif demo_choice == "LIMIT_BAL":
+                fig, ax = plt.subplots(figsize=(9, 4.5))
+                for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
+                    sns.kdeplot(df[df["Class"] == label]["LIMIT_BAL"] / 1000,
+                                ax=ax, label=name, color=color, fill=True, alpha=0.35)
+                ax.set_xlabel("Credit Limit (\u20b9 Thousands)")
+                ax.set_ylabel("Density")
+                ax.set_title("Credit Limit Distribution by Default Status", fontweight="bold")
+                ax.legend()
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                st.pyplot(fig)
+                st.caption("Lower credit limits are associated with higher default risk. "
+                           "In the Indian context, this correlates with CIBIL score bands.")
+
+        with eda_tab3:
+            st.markdown("#### Payment History Analysis")
+            st.markdown("Repayment status over 6 months (PAY_0 to PAY_6). "
+                        "Negative values indicate no balance or paid in full; positive values indicate delays.")
+            pay_col = st.selectbox("Select month", ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"],
+                                   format_func=lambda x: {"PAY_0": "Month 1 (latest)", "PAY_2": "Month 2",
+                                                           "PAY_3": "Month 3", "PAY_4": "Month 4",
+                                                           "PAY_5": "Month 5", "PAY_6": "Month 6"}[x])
+            fig, ax = plt.subplots(figsize=(10, 5))
+            grouped = df.groupby(pay_col)["Class"].mean()
+            counts_pay = df[pay_col].value_counts().sort_index()
+            ax.bar(grouped.index.astype(str), grouped.values,
+                   color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in grouped.values],
+                   edgecolor="white")
+            ax.axhline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
                        label=f"Overall ({df['Class'].mean():.1%})")
-            ax.set_xlabel("Default Rate")
-            ax.set_title("Default Rate by Education Level", fontweight="bold")
-            ax.legend()
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            st.pyplot(fig)
-
-        elif demo_choice == "MARRIAGE":
-            df_plot = df.copy()
-            df_plot["MARRIAGE"] = df_plot["MARRIAGE"].map(MARRIAGE_MAP).fillna("Unknown")
-            fig, ax = plt.subplots(figsize=(8, 4.5))
-            default_rates = df_plot.groupby("MARRIAGE")["Class"].mean()
-            ax.bar(default_rates.index, default_rates.values,
-                   color=["#1a56db", "#ef4444", "#64748b"], edgecolor="white", width=0.4)
+            ax.set_xlabel("Repayment Status (negative = paid, positive = delayed)")
             ax.set_ylabel("Default Rate")
-            ax.set_title("Default Rate by Marital Status", fontweight="bold")
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            for i, (idx, val) in enumerate(default_rates.items()):
-                ax.text(i, val + 0.005, f"{val:.1%}", ha="center", fontsize=10, fontweight="bold")
-            st.pyplot(fig)
-
-        elif demo_choice == "AGE":
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
-                sns.kdeplot(df[df["Class"] == label]["AGE"], ax=ax,
-                            label=name, color=color, fill=True, alpha=0.35)
-            ax.set_xlabel("Age")
-            ax.set_ylabel("Density")
-            ax.set_title("Age Distribution by Default Status", fontweight="bold")
+            ax.set_title(f"Default Rate by {pay_col} Repayment Status", fontweight="bold")
             ax.legend()
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             st.pyplot(fig)
-            st.caption("Younger borrowers (20\u201330) tend to have slightly higher default rates in this dataset.")
 
-        elif demo_choice == "LIMIT_BAL":
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
-                sns.kdeplot(df[df["Class"] == label]["LIMIT_BAL"] / 1000,
-                            ax=ax, label=name, color=color, fill=True, alpha=0.35)
-            ax.set_xlabel("Credit Limit (\u20b9 Thousands)")
-            ax.set_ylabel("Density")
-            ax.set_title("Credit Limit Distribution by Default Status", fontweight="bold")
+            st.markdown("#### Average Bill and Payment Amounts")
+            bill_means = df[BILL_FEATURES].mean()
+            pay_means = df[PAYMENT_AMT_FEATURES].mean()
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            x = range(len(BILL_FEATURES))
+            ax.plot(x, bill_means.values / 1000, marker="o", color="#1a56db", linewidth=2, label="Avg Bill Amount")
+            ax.plot(x, pay_means.values / 1000, marker="s", color="#22c55e", linewidth=2, label="Avg Payment Amount")
+            ax.set_xticks(x)
+            ax.set_xticklabels(["Month 1", "Month 2", "Month 3", "Month 4", "Month 5", "Month 6"])
+            ax.set_ylabel("Amount (\u20b9 Thousands)")
+            ax.set_title("Average Bill and Payment Amounts Over 6 Months", fontweight="bold")
             ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+
+        with eda_tab4:
+            st.markdown("#### Feature Correlation with Default")
+            st.markdown("Pearson correlation of all features with the default target.")
+
+            corr_data = df[UCI_FEATURES + ["Class"]].corr()["Class"].drop("Class").sort_values()
+
+            fig, ax = plt.subplots(figsize=(9, 10))
+            colors = ["#ef4444" if v < 0 else "#1a56db" for v in corr_data.values]
+            ax.barh(corr_data.index, corr_data.values, color=colors, edgecolor="white")
+            ax.axvline(0, color="black", linewidth=0.8)
+            ax.set_xlabel("Correlation with Default")
+            ax.set_title("Feature Correlation with Default Target", fontweight="bold")
+            st.pyplot(fig)
+
+            st.caption(
+                "PAY_0 (most recent repayment status) has the strongest positive correlation with default. "
+                "Higher credit limits (LIMIT_BAL) show negative correlation. "
+                "In Indian context, these align with CIBIL score components: payment history and credit utilization."
+            )
+    else:
+        with eda_tab2:
+            st.markdown("#### Feature Overview")
+            feat_cols = [c for c in df.columns if c != "Class"]
+            feat_type = st.selectbox("Select feature to visualise", feat_cols)
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            if df[feat_type].nunique() <= 10:
+                group_means = df.groupby(feat_type)["Class"].mean()
+                ax.bar(group_means.index.astype(str), group_means.values,
+                       color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in group_means.values],
+                       edgecolor="white")
+                ax.axhline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
+                           label=f"Overall ({df['Class'].mean():.1%})")
+                ax.set_xlabel(feat_type)
+                ax.set_ylabel("Default Rate")
+                ax.legend()
+            else:
+                for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
+                    sns.kdeplot(df[df["Class"] == label][feat_type], ax=ax,
+                                label=name, color=color, fill=True, alpha=0.35)
+                ax.set_xlabel(feat_type)
+                ax.set_ylabel("Density")
+            ax.set_title(f"Default Rate by {feat_type}", fontweight="bold")
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             st.pyplot(fig)
-            st.caption("Lower credit limits are associated with higher default risk. "
-                       "In the Indian context, this correlates with CIBIL score bands.")
 
-    with eda_tab3:
-        st.markdown("#### Payment History Analysis")
-        st.markdown("Repayment status over 6 months (PAY_0 to PAY_6). "
-                    "Negative values indicate no balance or paid in full; positive values indicate delays.")
-        pay_col = st.selectbox("Select month", ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"],
-                               format_func=lambda x: {"PAY_0": "Month 1 (latest)", "PAY_2": "Month 2",
-                                                       "PAY_3": "Month 3", "PAY_4": "Month 4",
-                                                       "PAY_5": "Month 5", "PAY_6": "Month 6"}[x])
-        fig, ax = plt.subplots(figsize=(10, 5))
-        grouped = df.groupby(pay_col)["Class"].mean()
-        counts_pay = df[pay_col].value_counts().sort_index()
-        ax.bar(grouped.index.astype(str), grouped.values,
-               color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in grouped.values],
-               edgecolor="white")
-        ax.axhline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
-                   label=f"Overall ({df['Class'].mean():.1%})")
-        ax.set_xlabel("Repayment Status (negative = paid, positive = delayed)")
-        ax.set_ylabel("Default Rate")
-        ax.set_title(f"Default Rate by {pay_col} Repayment Status", fontweight="bold")
-        ax.legend()
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        st.pyplot(fig)
-
-        st.markdown("#### Average Bill and Payment Amounts")
-        bill_means = df[BILL_FEATURES].mean()
-        pay_means = df[PAYMENT_AMT_FEATURES].mean()
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        x = range(len(BILL_FEATURES))
-        ax.plot(x, bill_means.values / 1000, marker="o", color="#1a56db", linewidth=2, label="Avg Bill Amount")
-        ax.plot(x, pay_means.values / 1000, marker="s", color="#22c55e", linewidth=2, label="Avg Payment Amount")
-        ax.set_xticks(x)
-        ax.set_xticklabels(["Month 1", "Month 2", "Month 3", "Month 4", "Month 5", "Month 6"])
-        ax.set_ylabel("Amount (\u20b9 Thousands)")
-        ax.set_title("Average Bill and Payment Amounts Over 6 Months", fontweight="bold")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        st.pyplot(fig)
-
-    with eda_tab4:
-        st.markdown("#### Feature Correlation with Default")
-        st.markdown("Pearson correlation of all features with the default target.")
-
-        corr_data = df[UCI_FEATURES + ["Class"]].corr()["Class"].drop("Class").sort_values()
-
-        fig, ax = plt.subplots(figsize=(9, 10))
-        colors = ["#ef4444" if v < 0 else "#1a56db" for v in corr_data.values]
-        ax.barh(corr_data.index, corr_data.values, color=colors, edgecolor="white")
-        ax.axvline(0, color="black", linewidth=0.8)
-        ax.set_xlabel("Correlation with Default")
-        ax.set_title("Feature Correlation with Default Target", fontweight="bold")
-        st.pyplot(fig)
-
-        st.caption(
-            "PAY_0 (most recent repayment status) has the strongest positive correlation with default. "
-            "Higher credit limits (LIMIT_BAL) show negative correlation. "
-            "In Indian context, these align with CIBIL score components: payment history and credit utilization."
-        )
+            st.markdown("#### Feature Correlation with Default")
+            corr_data = df[[c for c in df.columns if c != "Class"] + ["Class"]].corr()["Class"].drop("Class").sort_values()
+            fig, ax = plt.subplots(figsize=(9, max(5, len(corr_data) * 0.35)))
+            colors = ["#ef4444" if v < 0 else "#1a56db" for v in corr_data.values]
+            ax.barh(corr_data.index, corr_data.values, color=colors, edgecolor="white")
+            ax.axvline(0, color="black", linewidth=0.8)
+            ax.set_xlabel("Correlation with Default")
+            ax.set_title("Feature Correlation with Default Target", fontweight="bold")
+            st.pyplot(fig)
 
 
 elif active_tab == tabs[2]:
     if not st.session_state.data_loaded:
-        tab_placeholder(tabs[2])
+        st.error("Data loading failed. Select a different dataset from the sidebar.")
         st.stop()
     st.markdown("<div class='main-header'>Feature Engineering \u2014 Leak-Free Pipeline</div>",
                 unsafe_allow_html=True)
@@ -759,7 +1039,7 @@ elif active_tab == tabs[2]:
 
 elif active_tab == tabs[3]:
     if not st.session_state.data_loaded:
-        tab_placeholder(tabs[3])
+        st.error("Data loading failed. Select a different dataset from the sidebar.")
         st.stop()
     st.markdown("<div class='main-header'>Model Benchmarks</div>",
                 unsafe_allow_html=True)
@@ -902,7 +1182,7 @@ elif active_tab == tabs[3]:
 
 elif active_tab == tabs[4]:
     if not st.session_state.data_loaded:
-        tab_placeholder(tabs[4])
+        st.error("Data loading failed. Select a different dataset from the sidebar.")
         st.stop()
     st.markdown("<div class='main-header'>Scorecard & Decision Threshold</div>",
                 unsafe_allow_html=True)
@@ -1033,7 +1313,7 @@ elif active_tab == tabs[4]:
 
 elif active_tab == tabs[5]:
     if not st.session_state.data_loaded:
-        tab_placeholder(tabs[5])
+        st.error("Data loading failed. Select a different dataset from the sidebar.")
         st.stop()
     st.markdown("<div class='main-header'>Explainability \u2014 Feature Attribution</div>",
                 unsafe_allow_html=True)
@@ -1134,7 +1414,7 @@ elif active_tab == tabs[5]:
 
 elif active_tab == tabs[6]:
     if not st.session_state.data_loaded:
-        tab_placeholder(tabs[6])
+        st.error("Data loading failed. Select a different dataset from the sidebar.")
         st.stop()
     st.markdown("<div class='main-header'>Model Card & About</div>",
                 unsafe_allow_html=True)
@@ -1148,16 +1428,20 @@ elif active_tab == tabs[6]:
     best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n]["proba"] is not None else 0))
     best_pr = models[best_name]["pr_auc"]
     cv_best = max(v["mean"] for v in cv_results.values())
+    ds_name = st.session_state.dataset_name
+    ds_meta = DATASET_REGISTRY.get(ds_name)
+    src_name = ds_meta["source"] if ds_meta else ds_name
+    n_feats_mc = len(df.columns) - 1
 
     model_card = {
-        "Model Name": "DefaultRisk-LightGBM-v1",
+        "Model Name": "DefaultRisk-v1",
         "Task": "Binary classification (default vs non-default)",
         "Regulatory Context": "RBI Basel III \u2014 IRB approach for PD estimation",
         "Training Data": {
-            "Source": "UCI Default of Credit Card Clients (adapted for Indian context)",
+            "Source": src_name,
             "Rows": f"{len(df):,}",
             "Default Rate": f"{df['Class'].mean():.1%}",
-            "Features": "23 (demographics + 6-month payment/bill history)",
+            "Features": f"{n_feats_mc}",
         },
         "Model Architecture": best_name,
         "Primary Metric": "PR-AUC (Average Precision)",
@@ -1184,11 +1468,13 @@ elif active_tab == tabs[6]:
 
     with c_lim:
         st.markdown("**Limitations**")
-        st.markdown("""
-        - Dataset from Taiwan (2005) \u2014 Indian demographic mapping is illustrative, not exact
+        ds_meta_lim = DATASET_REGISTRY.get(st.session_state.dataset_name)
+        lim_note = f"Dataset from {ds_meta_lim['country']} ({ds_meta_lim['year']})" if ds_meta_lim else "Dataset source"
+        st.markdown(f"""
+        - {lim_note} \u2014 Indian demographic mapping is illustrative, not exact
         - No CIBIL/credit bureau scores directly available in this dataset
         - No reject inference \u2014 only approved accounts in training data
-        - 6-month payment window may not capture long-term credit behavior
+        - Feature set may not capture long-term credit behavior
         """)
 
     st.markdown("---")
@@ -1245,7 +1531,7 @@ elif active_tab == tabs[6]:
     st.markdown(
         "<div class='footer'>"
         "DefaultRisk v1.0  \u00b7  Built with Streamlit  \u00b7  "
-        "Dataset: UCI Default of Credit Card Clients  \u00b7  "
+        f"Dataset: {st.session_state.dataset_name}  \u00b7  "
         f"Last updated: {datetime.now().strftime('%B %Y')}"
         "</div>",
         unsafe_allow_html=True,
@@ -1254,10 +1540,11 @@ elif active_tab == tabs[6]:
 
 st.sidebar.markdown("---")
 if st.session_state.data_loaded:
+    ds_short = st.session_state.dataset_name.split("(")[0].strip()
     st.sidebar.caption(
-        "\U0001f3e6 DefaultRisk v1.0  \n"
-        "Built with Python + Streamlit  \n"
-        f"\U0001f4ca {len(df):,} accounts  \u00b7  {int(df['Class'].sum())} defaults"
+        f"\U0001f3e6 DefaultRisk v1.0  \n"
+        f"{ds_short}  \n"
+        f"\U0001f4ca {len(df):,} rows  \u00b7  {int(df['Class'].sum())} defaults"
     )
 else:
     st.sidebar.caption("\U0001f3e6 DefaultRisk v1.0  \u00b7  Built with Python + Streamlit")
