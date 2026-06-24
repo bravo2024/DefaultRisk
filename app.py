@@ -215,8 +215,8 @@ def load_uci_default():
             target = data.data.targets.copy()
             df["Class"] = target.values.astype(int).ravel()
             df.columns = [str(c).strip().upper() for c in df.columns]
-            if "CLASS" not in df.columns:
-                df["Class"] = target.values.astype(int).ravel()
+            if "CLASS" in df.columns:
+                df = df.rename(columns={"CLASS": "Class"})
             return df
         except Exception:
             pass
