@@ -500,7 +500,7 @@ def fig_to_base64(fig):
 
 _tab_descriptions = {
     "Overview": "Business context for credit card default prediction in the Indian banking ecosystem. Covers CIBIL/credit bureau data, RBI regulatory framework, and NPA classification.",
-    "Data Explorer": "Analysis of the UCI Default of Credit Card Clients dataset adapted for Indian context — demographics, payment history, bill amounts, and default distributions.",
+    "Data Explorer": "Analysis of the selected dataset — target distribution, feature analysis, correlations, and demographic patterns (when available).",
     "Feature Engineering": "Encoding pipeline for mixed data types fitted on training data only to prevent leakage. Label encoding for categoricals, standard scaling for numerics.",
     "Model Benchmarks": "Three classifiers compared using 5-fold cross-validation, hold-out test metrics, confusion matrices, and McNemar's statistical significance test.",
     "Scorecard": "Credit score distribution, approval rates by threshold, gain/lift charts for operational queue management, and cost-sensitive threshold optimization.",
@@ -599,6 +599,13 @@ with st.sidebar.expander("Upload Custom Data"):
             except Exception as e:
                 st.error(f"Error loading URL: {e}")
 
+with st.sidebar.expander("About Indian Bank Data"):
+    st.markdown(
+        "No Indian-specific credit default dataset is publicly available via API. "
+        "For real Indian data, download the **Indian Bank Credit Card** dataset from "
+        "[Kaggle](https://www.kaggle.com/datasets) and upload via **Upload Custom Data** above."
+    )
+
 tabs = [
     "Overview",
     "Data Explorer",
@@ -617,32 +624,19 @@ st.session_state._last_tab = active_tab
 st.sidebar.markdown("---")
 
 
-def auto_load_data():
-    """Load default dataset and train models. Called once on startup."""
-    if st.session_state.get("_load_attempted", False):
-        st.error(
-            f"Failed to load {st.session_state.dataset_name}. "
-            "Try selecting a different dataset from the sidebar, "
-            "or upload a custom CSV file."
-        )
-        st.session_state.data_loaded = True
-        st.session_state.df = make_synthetic_data()
-        return
-    st.session_state._load_attempted = True
+def load_and_train():
+    """Load selected dataset and train models. Called on button click."""
     ds_name = st.session_state.dataset_name
-    with st.status(f"Loading {ds_name}...", expanded=True) as status:
+    with st.spinner(f"Loading {ds_name}..."):
         df = load_data(ds_name)
-        if df is not None:
-            status.update(label=f"{ds_name} loaded ({len(df):,} rows)", state="complete")
-            st.session_state.df = df
-            st.session_state.dataset_error = None
-        else:
-            status.update(label="Dataset unavailable — using synthetic data", state="error")
-            df = make_synthetic_data()
-            st.session_state.df = df
-            st.session_state.dataset_error = f"Could not load {ds_name}. Using synthetic demo data."
-
-    with st.status("Training models...", expanded=True) as status:
+    if df is None:
+        st.warning(f"Could not load {ds_name}. Using synthetic demo data.")
+        df = make_synthetic_data()
+        st.session_state.dataset_error = f"Could not load {ds_name}. Using synthetic demo data."
+    else:
+        st.session_state.dataset_error = None
+    st.session_state.df = df
+    with st.spinner("Training models (may take a minute)..."):
         try:
             results = train_and_evaluate(df)
             st.session_state.results = results
@@ -650,16 +644,38 @@ def auto_load_data():
             st.session_state.X_test = results["X_test"]
             st.session_state.models = results["models"]
             st.session_state.cv_results = results["cv_results"]
-            st.session_state.data_loaded = True
-            status.update(label="Models trained", state="complete")
         except Exception as e:
-            status.update(label=f"Training failed: {e}", state="error")
-            st.session_state.data_loaded = True
+            st.error(f"Model training failed: {e}")
+            st.session_state.results = None
+            st.session_state.y_test = None
+            st.session_state.X_test = None
+            st.session_state.models = {}
+            st.session_state.cv_results = {}
+    st.session_state.data_loaded = True
     st.rerun()
 
-# ── Auto-load on first visit or dataset change ────────────────────────
+
+def tab_placeholder(tab_name):
+    desc = _tab_descriptions.get(tab_name, "DefaultRisk analysis dashboard.")
+    st.markdown(f"<div class='main-header'>{tab_name}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='sub-header'>{desc}</div>", unsafe_allow_html=True)
+    st.markdown("---")
+    ds_name = st.session_state.dataset_name
+    st.info(f"Select a dataset from the sidebar, then click the button below to load **{ds_name}** and train models.")
+    if st.button("Load Dataset & Train Models", type="primary", use_container_width=True):
+        load_and_train()
+
+
+# ── Data-load guard ───────────────────────────────────────────────────
 if not st.session_state.data_loaded:
-    auto_load_data()
+    st.markdown(
+        "<div style='background:#f0f7ff; border:1px solid #bdd3eb; border-radius:10px; "
+        "padding:1rem 1.5rem; margin-bottom:1rem;'>"
+        "<b>\U0001f3e6 DefaultRisk</b> \u2014 Select a dataset from the sidebar, then "
+        "click <b>Load Dataset & Train Models</b> on any tab to begin. "
+        "Each tab describes the analysis it contains.</div>",
+        unsafe_allow_html=True,
+    )
 
 df = st.session_state.df
 results = st.session_state.results
@@ -676,6 +692,9 @@ is_uci = bool(
 )
 
 if active_tab == tabs[0]:
+    if not st.session_state.data_loaded:
+        tab_placeholder(tabs[0])
+        st.stop()
     st.markdown("<div class='main-header'>Overview \u2014 Credit Risk in Indian Banking</div>",
                 unsafe_allow_html=True)
     st.markdown(
@@ -773,7 +792,7 @@ if active_tab == tabs[0]:
 
 elif active_tab == tabs[1]:
     if not st.session_state.data_loaded:
-        st.error("Data loading failed. Select a different dataset from the sidebar.")
+        tab_placeholder(tabs[1])
         st.stop()
 
     ds_name = st.session_state.dataset_name
@@ -1011,7 +1030,7 @@ elif active_tab == tabs[1]:
 
 elif active_tab == tabs[2]:
     if not st.session_state.data_loaded:
-        st.error("Data loading failed. Select a different dataset from the sidebar.")
+        tab_placeholder(tabs[2])
         st.stop()
     st.markdown("<div class='main-header'>Feature Engineering \u2014 Leak-Free Pipeline</div>",
                 unsafe_allow_html=True)
@@ -1071,7 +1090,7 @@ elif active_tab == tabs[2]:
 
 elif active_tab == tabs[3]:
     if not st.session_state.data_loaded:
-        st.error("Data loading failed. Select a different dataset from the sidebar.")
+        tab_placeholder(tabs[3])
         st.stop()
     st.markdown("<div class='main-header'>Model Benchmarks</div>",
                 unsafe_allow_html=True)
@@ -1179,8 +1198,8 @@ elif active_tab == tabs[3]:
     )
 
     lr_name = "Logistic Regression"
-    best_model_name = [n for n in models.keys() if models[n]["pred"] is not None]
-    best_model_name = max(best_model_name, key=lambda n: models[n]["pr_auc"])
+    valid_models = [n for n in models.keys() if models[n].get("pred") is not None]
+    best_model_name = max(valid_models, key=lambda n: models[n]["pr_auc"]) if valid_models else (lr_name if lr_name in models else list(models.keys())[0])
 
     if lr_name in models and models[lr_name]["pred"] is not None:
         lr_pred = models[lr_name]["pred"]
@@ -1214,7 +1233,7 @@ elif active_tab == tabs[3]:
 
 elif active_tab == tabs[4]:
     if not st.session_state.data_loaded:
-        st.error("Data loading failed. Select a different dataset from the sidebar.")
+        tab_placeholder(tabs[4])
         st.stop()
     st.markdown("<div class='main-header'>Scorecard & Decision Threshold</div>",
                 unsafe_allow_html=True)
@@ -1225,7 +1244,7 @@ elif active_tab == tabs[4]:
     )
     st.markdown("---")
 
-    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n]["proba"] is not None else 0))
+    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
     best_proba = models[best_name]["proba"]
 
     if best_proba is not None:
@@ -1345,7 +1364,7 @@ elif active_tab == tabs[4]:
 
 elif active_tab == tabs[5]:
     if not st.session_state.data_loaded:
-        st.error("Data loading failed. Select a different dataset from the sidebar.")
+        tab_placeholder(tabs[5])
         st.stop()
     st.markdown("<div class='main-header'>Explainability \u2014 Feature Attribution</div>",
                 unsafe_allow_html=True)
@@ -1363,7 +1382,7 @@ elif active_tab == tabs[5]:
         )
         st.markdown("SHAP uses cooperative game theory to attribute feature contributions to individual predictions.")
     else:
-        best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n]["proba"] is not None else 0))
+    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
 
         X_all = df.drop(columns=["Class"])
         y_all = df["Class"]
@@ -1446,7 +1465,7 @@ elif active_tab == tabs[5]:
 
 elif active_tab == tabs[6]:
     if not st.session_state.data_loaded:
-        st.error("Data loading failed. Select a different dataset from the sidebar.")
+        tab_placeholder(tabs[6])
         st.stop()
     st.markdown("<div class='main-header'>Model Card & About</div>",
                 unsafe_allow_html=True)
@@ -1457,9 +1476,9 @@ elif active_tab == tabs[6]:
     )
     st.markdown("---")
 
-    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n]["proba"] is not None else 0))
+    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
     best_pr = models[best_name]["pr_auc"]
-    cv_best = max(v["mean"] for v in cv_results.values())
+    cv_best = max((v["mean"] for v in cv_results.values()), default=0)
     ds_name = st.session_state.dataset_name
     ds_meta = DATASET_REGISTRY.get(ds_name)
     src_name = ds_meta["source"] if ds_meta else ds_name
