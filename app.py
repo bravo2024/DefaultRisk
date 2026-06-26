@@ -62,6 +62,7 @@ defaults = {
     "models": None,
     "cv_results": None,
     "models_selected": ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"],
+    "decision_threshold": 0.5,
     "loading": False,
     "abort": False,
 }
@@ -457,16 +458,14 @@ def train_and_evaluate(_df, selected_models=None, progress_bar=None, status_text
             calib = CalibratedClassifierCV(estimator=pipe, method="isotonic", cv=3)
             calib.fit(X_train, y_train)
             proba = calib.predict_proba(X_test)[:, 1]
-            pred = (proba >= 0.5).astype(int)
             pipe_saved = calib
         else:
             pipe.fit(X_train, y_train)
             proba = pipe.predict_proba(X_test)[:, 1]
-            pred = (proba >= 0.5).astype(int)
             pipe_saved = pipe
 
         models[name] = {
-            "pipeline": pipe_saved, "proba": proba, "pred": pred,
+            "pipeline": pipe_saved, "proba": proba, "pred": None,
             "pr_auc": average_precision_score(y_test, proba),
             "roc_auc": roc_auc_score(y_test, proba),
         }
@@ -569,6 +568,13 @@ st.sidebar.multiselect(
     key="models_selected",
     disabled=st.session_state.get("loading", False),
 )
+
+if st.session_state.data_loaded:
+    st.sidebar.markdown("### Decision Threshold")
+    st.sidebar.slider(
+        "PD ≥ t → reject", 0.0, 1.0, key="decision_threshold", step=0.01,
+        help="Borrowers with predicted default probability ≥ t are classified as default.",
+    )
 
 with st.sidebar.expander("Available Datasets"):
     for name, m in DATASET_REGISTRY.items():
@@ -1211,10 +1217,11 @@ elif active_tab == tabs[3]:
 
     st.markdown("### Hold-Out Test Set")
     rows = []
+    thr = st.session_state["decision_threshold"]
     for name, m in models.items():
         if m["proba"] is not None:
             yt = y_test
-            pred = m["pred"]
+            pred = (m["proba"] >= thr).astype(int)
             proba = m["proba"]
             cm = confusion_matrix(yt, pred)
             tn, fp, fn, tp = cm.ravel()
@@ -1237,9 +1244,10 @@ elif active_tab == tabs[3]:
 
     st.markdown("### Confusion Matrices")
     conf_cols = st.columns(3)
+    thr = st.session_state["decision_threshold"]
     for idx, (name, m) in enumerate(models.items()):
-        if m["pred"] is not None:
-            cm = confusion_matrix(y_test, m["pred"])
+        if m["proba"] is not None:
+            cm = confusion_matrix(y_test, (m["proba"] >= thr).astype(int))
             tn, fp, fn, tp = cm.ravel()
             with conf_cols[idx % 3]:
                 fig, ax = plt.subplots(figsize=(3.5, 3.5))
@@ -1264,12 +1272,13 @@ elif active_tab == tabs[3]:
     )
 
     lr_name = "Logistic Regression"
-    valid_models = [n for n in models.keys() if models[n].get("pred") is not None]
+    thr = st.session_state["decision_threshold"]
+    valid_models = [n for n in models.keys() if models[n].get("proba") is not None]
     best_model_name = max(valid_models, key=lambda n: models[n]["pr_auc"]) if valid_models else (lr_name if lr_name in models else list(models.keys())[0])
 
-    if lr_name in models and models[lr_name]["pred"] is not None:
-        lr_pred = models[lr_name]["pred"]
-        best_pred = models[best_model_name]["pred"]
+    if lr_name in models and models[lr_name]["proba"] is not None:
+        lr_pred = (models[lr_name]["proba"] >= thr).astype(int)
+        best_pred = (models[best_model_name]["proba"] >= thr).astype(int)
 
         both_correct = ((lr_pred == y_test) & (best_pred == y_test)).sum()
         lr_only = ((lr_pred == y_test) & (best_pred != y_test)).sum()
