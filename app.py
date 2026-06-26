@@ -650,10 +650,10 @@ def load_and_train():
 def _do_load_and_train():
     """Actual load + train, called after rerun so UI shows loading state."""
     ds_name = st.session_state.dataset_name
-    status = st.sidebar.empty()
-    progress = st.sidebar.progress(0)
+    status = st.empty()
+    progress = st.progress(0)
 
-    status.text(f"Loading {ds_name}…")
+    status.text(f"Loading {ds_name}...")
     df = load_data(ds_name)
     if df is None:
         st.warning(f"Could not load {ds_name}. Using synthetic demo data.")
@@ -740,14 +740,12 @@ if active_tab == tabs[0]:
         st.slider(
             "Default probability (reject if PD >= t)",
             0.0, 1.0, key="decision_threshold", step=0.01,
-            disabled=not st.session_state.data_loaded,
         )
 
-    if st.button("Train", type="primary", use_container_width=True, disabled=loading):
+    if st.button("Load dataset & train", type="primary", use_container_width=True, disabled=loading):
         load_and_train()
 
     if loading:
-        st.info("Training... see sidebar for progress.")
         st.stop()
 
     if not st.session_state.data_loaded:
