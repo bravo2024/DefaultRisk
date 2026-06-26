@@ -61,7 +61,9 @@ defaults = {
     "X_test": None,
     "models": None,
     "cv_results": None,
-    "models_selected": ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"],
+    "sel_Logistic Regression": True,
+    "sel_Random Forest": True,
+    "sel_LightGBM (Calibrated)": True,
     "decision_threshold": 0.5,
     "loading": False,
     "abort": False,
@@ -557,21 +559,6 @@ if meta:
     )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Models to Train")
-model_options = ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"]
-st.sidebar.multiselect(
-    "Select models",
-    model_options,
-    key="models_selected",
-    disabled=st.session_state.get("loading", False),
-)
-
-st.sidebar.markdown("### Threshold")
-st.sidebar.slider(
-    "Default probability (reject if PD >= t)",
-    0.0, 1.0, key="decision_threshold", step=0.01,
-    disabled=not st.session_state.data_loaded,
-)
 
 with st.sidebar.expander("Available Datasets"):
     for name, m in DATASET_REGISTRY.items():
@@ -676,9 +663,9 @@ def _do_load_and_train():
         st.session_state.dataset_error = None
     st.session_state.df = df
 
-    sel = st.session_state.get("models_selected", list(MODEL_SPECS.keys()))
+    sel = [m for m in MODEL_SPECS if st.session_state.get(f"sel_{m}", True)]
     if not sel:
-        st.warning("Please select at least one model in the sidebar before training.")
+        st.warning("Select at least one model before training.")
         st.session_state.loading = False
         st.rerun()
         return
@@ -712,22 +699,18 @@ def _do_load_and_train():
 def tab_placeholder(tab_name):
     st.markdown(f"### {tab_name}")
     st.markdown(_tab_descriptions.get(tab_name, ""))
-    ds_name = st.session_state.dataset_name
-    loading = st.session_state.get("loading", False)
-    if loading:
-        st.info(f"Training {ds_name}...")
+    if st.session_state.get("loading", False):
+        st.info("Training in progress...")
     else:
-        st.write(f"Load **{ds_name}** to begin.")
-    if st.button("Load dataset and train", type="primary", use_container_width=True, disabled=loading):
-        load_and_train()
+        st.info("Go to **Overview** to load the dataset and train models.")
 
 
 # ── Execute training if triggered ──────────────────────────────────────
 if st.session_state.get("loading", False):
     _do_load_and_train()
 
-if not st.session_state.data_loaded:
-    st.info("Select a dataset in the sidebar and click **Load dataset and train** on any tab.")
+if not st.session_state.data_loaded and not st.session_state.get("loading", False):
+    st.info("Select a dataset in the sidebar, then click **Train** below.")
 
 df = st.session_state.df
 results = st.session_state.results
@@ -744,10 +727,31 @@ is_uci = bool(
 )
 
 if active_tab == tabs[0]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[0])
-        st.stop()
     st.markdown("### Overview")
+    loading = st.session_state.get("loading", False)
+
+    col_left, col_right = st.columns([1, 1])
+    with col_left:
+        st.markdown("**Models**")
+        for m in ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"]:
+            st.checkbox(m, key=f"sel_{m}", value=True, disabled=loading)
+    with col_right:
+        st.markdown("**Threshold**")
+        st.slider(
+            "Default probability (reject if PD >= t)",
+            0.0, 1.0, key="decision_threshold", step=0.01,
+            disabled=not st.session_state.data_loaded,
+        )
+
+    if st.button("Train", type="primary", use_container_width=True, disabled=loading):
+        load_and_train()
+
+    if loading:
+        st.info("Training... see sidebar for progress.")
+        st.stop()
+
+    if not st.session_state.data_loaded:
+        st.stop()
     ds_name = st.session_state.dataset_name
     ds_meta = DATASET_REGISTRY.get(ds_name)
     defaults_count = int(df["Class"].sum())
