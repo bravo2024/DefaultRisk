@@ -514,22 +514,19 @@ def fig_to_base64(fig):
 
 
 _tab_descriptions = {
-    "Overview": "Business context for credit card default prediction in the Indian banking ecosystem. Covers CIBIL/credit bureau data, RBI regulatory framework, and NPA classification.",
-    "Data Explorer": "Analysis of the selected dataset — target distribution, feature analysis, correlations, and demographic patterns (when available).",
-    "Feature Engineering": "Encoding pipeline for mixed data types fitted on training data only to prevent leakage. Label encoding for categoricals, standard scaling for numerics.",
-    "Model Benchmarks": "Three classifiers compared using 5-fold cross-validation, hold-out test metrics, confusion matrices, and McNemar's statistical significance test.",
-    "Scorecard": "Credit score distribution, approval rates by threshold, gain/lift charts for operational queue management, and cost-sensitive threshold optimization.",
-    "Explainability": "SHAP-based feature attribution showing which borrower characteristics drive default probability.",
-    "Model Card & About": "Model documentation covering intended use, limitations, monitoring plan, technology stack, and project context.",
+    "Overview": "Credit risk context, dataset summary, regulatory framework.",
+    "Data Explorer": "Target distribution, feature analysis, correlations.",
+    "Feature Engineering": "Encoding + scaling pipeline fitted on training data to prevent leakage.",
+    "Model Benchmarks": "3 classifiers compared via 3-fold CV, hold-out metrics, confusion matrices, McNemar test.",
+    "Scorecard": "Score distribution, approval rates by threshold, gain/lift, cost-sensitive threshold optimization.",
+    "Explainability": "SHAP feature attribution for individual predictions.",
+    "Model Card & About": "Documentation, intended use, limitations.",
 }
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────────
-st.sidebar.markdown(
-    "<h1 style='font-size:1.6rem; margin-bottom:0;'>\U0001f3e6 DefaultRisk</h1>",
-    unsafe_allow_html=True,
-)
-st.sidebar.caption("Credit default PD model  \u00b7  Indian Banking Context")
+st.sidebar.markdown("## DefaultRisk")
+st.sidebar.caption("Probability of Default  \u00b7  Indian banking context")
 st.sidebar.markdown("---")
 
 ds_options = list(DATASET_REGISTRY.keys())
@@ -569,12 +566,12 @@ st.sidebar.multiselect(
     disabled=st.session_state.get("loading", False),
 )
 
-if st.session_state.data_loaded:
-    st.sidebar.markdown("### Decision Threshold")
-    st.sidebar.slider(
-        "PD ≥ t → reject", 0.0, 1.0, key="decision_threshold", step=0.01,
-        help="Borrowers with predicted default probability ≥ t are classified as default.",
-    )
+st.sidebar.markdown("### Threshold")
+st.sidebar.slider(
+    "Default probability (reject if PD >= t)",
+    0.0, 1.0, key="decision_threshold", step=0.01,
+    disabled=not st.session_state.data_loaded,
+)
 
 with st.sidebar.expander("Available Datasets"):
     for name, m in DATASET_REGISTRY.items():
@@ -713,18 +710,15 @@ def _do_load_and_train():
 
 
 def tab_placeholder(tab_name):
-    desc = _tab_descriptions.get(tab_name, "DefaultRisk analysis dashboard.")
-    st.markdown(f"<div class='main-header'>{tab_name}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='sub-header'>{desc}</div>", unsafe_allow_html=True)
-    st.markdown("---")
+    st.markdown(f"### {tab_name}")
+    st.markdown(_tab_descriptions.get(tab_name, ""))
     ds_name = st.session_state.dataset_name
     loading = st.session_state.get("loading", False)
     if loading:
-        st.info(f"Training in progress — **{ds_name}** — see sidebar for progress.")
+        st.info(f"Training {ds_name}...")
     else:
-        st.info(f"Select a dataset from the sidebar, then click the button below to load **{ds_name}** and train models.")
-    btn_label = "Loading\u2026" if loading else "Load Dataset & Train Models"
-    if st.button(btn_label, type="primary", use_container_width=True, disabled=loading):
+        st.write(f"Load **{ds_name}** to begin.")
+    if st.button("Load dataset and train", type="primary", use_container_width=True, disabled=loading):
         load_and_train()
 
 
@@ -732,16 +726,8 @@ def tab_placeholder(tab_name):
 if st.session_state.get("loading", False):
     _do_load_and_train()
 
-# ── Data-load guard ───────────────────────────────────────────────────
 if not st.session_state.data_loaded:
-    st.markdown(
-        "<div style='background:#f0f7ff; border:1px solid #bdd3eb; border-radius:10px; "
-        "padding:1rem 1.5rem; margin-bottom:1rem;'>"
-        "<b>\U0001f3e6 DefaultRisk</b> \u2014 Select a dataset from the sidebar, then "
-        "click <b>Load Dataset & Train Models</b> on any tab to begin. "
-        "Each tab describes the analysis it contains.</div>",
-        unsafe_allow_html=True,
-    )
+    st.info("Select a dataset in the sidebar and click **Load dataset and train** on any tab.")
 
 df = st.session_state.df
 results = st.session_state.results
@@ -761,99 +747,26 @@ if active_tab == tabs[0]:
     if not st.session_state.data_loaded:
         tab_placeholder(tabs[0])
         st.stop()
-    st.markdown("<div class='main-header'>Overview \u2014 Credit Risk in Indian Banking</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>Probability of Default (PD) estimation for credit card portfolios "
-        "is a key component of credit risk management under RBI\u2019s Basel III framework.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Overview")
+    ds_name = st.session_state.dataset_name
+    ds_meta = DATASET_REGISTRY.get(ds_name)
+    defaults_count = int(df["Class"].sum())
+    total = len(df)
+    n_feats = len(df.columns) - 1
 
-    col1, col2 = st.columns([1.4, 1])
-    with col1:
-        st.markdown("###  Problem Context")
-        st.markdown(
-            "Indian banks and NBFCs face three structural challenges in credit card default prediction:"
-        )
-        bullets = [
-            ("**CIBIL / Credit Bureau Data**",
-             "India has four major credit bureaus (CIBIL/TransUnion, Experian, Equifax, CRIF High Mark). "
-             "Credit scores range from 300\u2013900. Payment history, credit utilization, and inquiry patterns are key predictors."),
-            ("**RBI Regulatory Framework**",
-             "Basel III implementation by RBI requires banks to estimate PD, LGD, and EAD for capital adequacy under the IRB approach. "
-             "NPAs (Non-Performing Assets) are classified as 90+ days overdue per RBI guidelines."),
-            ("**Asymmetric Costs**",
-             "A default (FN) results in principal loss and NPA provisioning. A false positive (FP) declines a good customer, "
-             "losing interest income and relationship value. The cost ratio depends on ticket size and recovery rate."),
-        ]
-        for title, desc in bullets:
-            st.markdown(f"- {title}: {desc}")
-
-    with col2:
-        st.markdown("###  Dataset Summary")
-        ds_name = st.session_state.dataset_name
-        ds_meta = DATASET_REGISTRY.get(ds_name)
-        defaults_count = int(df["Class"].sum())
-        total = len(df)
-        n_feats = len(df.columns) - 1
-        source_name = ds_meta["source"] if ds_meta else "Custom upload"
-        desc_text = ds_meta["desc"] if ds_meta else ""
-        ds_url = ds_meta.get("url", "") if ds_meta else ""
-        url_link = f'<br><a href="{ds_url}" target="_blank">View source \u2197</a>' if ds_url else ""
-        st.markdown(
-            f'<div class="metric-card">'
-            f"<b>{ds_name}</b><br><br>"
-            f" Accounts: {total:,}<br>"
-            f" Defaults: {defaults_count:,} ({df['Class'].mean():.1%})<br>"
-            f" Features: {n_feats}<br>"
-            f" Source: {source_name}{url_link}"
-            f"<br><br>{desc_text}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Default rate", f"{df['Class'].mean():.1%}")
+    c2.metric("Accounts", f"{total:,}")
+    c3.metric("Features", n_feats)
 
     st.markdown("---")
-    st.markdown("###  Key Metrics in Indian Credit Risk")
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Default Rate", f"{df['Class'].mean():.1%}",
-                  help="Proportion of accounts that defaulted on payment")
-    with c2:
-        st.metric("Accounts", f"{total:,}",
-                  help="Total observations in dataset")
-    with c3:
-        st.metric("Features", f"{n_feats}",
-                  help="Number of feature columns in the dataset")
-    with c4:
-        st.metric("Regulatory Standard", "RBI Basel III",
-                  help="IRB approach for PD estimation")
-
-    st.markdown("###  Techniques Used")
-    techs = pd.DataFrame({
-        "Technique": [
-            "PR-AUC over ROC-AUC",
-            "Stratified cross-validation",
-            "Probability calibration",
-            "Class weighting",
-            "Leak-free feature pipeline",
-            "SHAP explainability",
-            "Gain/Lift charts",
-            "Cost-sensitive threshold",
-        ],
-        "Why": [
-            "Honest metric under class imbalance",
-            "Accounts for limited sample size",
-            "Produces unbiased PD estimates",
-            "Addresses asymmetric class distribution",
-            "Prevents data leakage in encoding",
-            "Regulatory compliance for adverse-action notices",
-            "Evaluates ranking performance",
-            "Aligns model with P&L impact",
-        ],
-    })
-    st.dataframe(techs, use_container_width=True, hide_index=True)
+    st.markdown("### Dataset")
+    st.write(f"**{ds_name}**")
+    if ds_meta:
+        st.write(ds_meta["desc"])
+        st.write(f"Source: {ds_meta['source']} ({ds_meta['country']})")
+        if ds_meta.get("url"):
+            st.write(f"Link: [{ds_meta['url']}]({ds_meta['url']})")
 
 
 elif active_tab == tabs[1]:
@@ -862,13 +775,7 @@ elif active_tab == tabs[1]:
         st.stop()
 
     ds_name = st.session_state.dataset_name
-    st.markdown(f"<div class='main-header'>Data Explorer \u2014 {ds_name}</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>Target distribution, feature analysis, and correlations.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Data Explorer")
 
     if is_uci:
         eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs([
@@ -1098,13 +1005,7 @@ elif active_tab == tabs[2]:
     if not st.session_state.data_loaded:
         tab_placeholder(tabs[2])
         st.stop()
-    st.markdown("<div class='main-header'>Feature Engineering \u2014 Leak-Free Pipeline</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>Encoding and scaling implemented inside an sklearn Pipeline to prevent data leakage.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Feature Engineering")
 
     st.markdown(
         "The UCI dataset contains a mix of categorical features (gender, education, marriage) and numeric features "
@@ -1161,14 +1062,7 @@ elif active_tab == tabs[3]:
     if not cv_results or not models:
         st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
         st.stop()
-    st.markdown("<div class='main-header'>Model Benchmarks</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>Three classifiers compared using 3-fold stratified cross-validation, "
-        "hold-out test metrics, confusion matrices, and McNemar\u2019s test.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Model Benchmarks")
 
     st.markdown("### Cross-Validation (3-Fold Stratified)")
     st.markdown("**Primary metric: PR-AUC** \u2014 measures ranking performance on the default class.")
@@ -1313,14 +1207,7 @@ elif active_tab == tabs[4]:
     if not models:
         st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
         st.stop()
-    st.markdown("<div class='main-header'>Scorecard & Decision Threshold</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>Credit score distribution, approval rates by threshold, "
-        "gain/lift charts, and cost-sensitive threshold optimization.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Scorecard")
 
     best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
     best_proba = models[best_name]["proba"]
@@ -1447,14 +1334,7 @@ elif active_tab == tabs[5]:
     if not models:
         st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
         st.stop()
-    st.markdown("<div class='main-header'>Explainability \u2014 Feature Attribution</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>SHAP-based feature attribution showing which borrower characteristics "
-        "drive default probability, supporting RBI\u2019s fair-lending guidelines.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Explainability")
 
     if not HAS_SHAP:
         st.warning(
@@ -1551,14 +1431,7 @@ elif active_tab == tabs[6]:
     if not models or not cv_results:
         st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
         st.stop()
-    st.markdown("<div class='main-header'>Model Card & About</div>",
-                unsafe_allow_html=True)
-    st.markdown(
-        "<div class='sub-header'>Documentation covering intended use, limitations, monitoring plan, "
-        "and technical details for model governance.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.markdown("### Model Card")
 
     best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
     best_pr = models[best_name]["pr_auc"]
