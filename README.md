@@ -1,77 +1,46 @@
-# DefaultRisk — Loan Default Prediction
+# DefaultRisk - Wells Fargo
 
-Probability of Default (PD) model for retail banking credit risk, built for the German Credit dataset. Demonstrates production-grade ML pipelines, scorecard visualization, and regulatory-ready explainability.
+> Loan default PD model with scorecard explainability.
 
-Built for data science and ML engineering roles in banking and fintech.
+**Company group:** Fintech / Banking / Quant  
+**Task type:** tabular  
+**App / framework:** streamlit  
+**Dataset:** Lending Club + IEEE-CIS  
+**Data links:** https://www.kaggle.com/datasets/wordsforthewise/lending-club
 
----
-
-## Quick Start
-
+## Quickstart (runs out of the box, no downloads)
 ```bash
-# Clone the repo
-git clone https://github.com/bravo2024/DefaultRisk-streamlit.git
-cd DefaultRisk-streamlit
-
-# Install dependencies
+python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# Run the app
-streamlit run app.py
+python train.py            # trains on synthetic data, writes models/metrics.json
+pytest -q                  # smoke test the pipeline
+streamlit run app.py        # launches Streamlit dashboard
 ```
 
-The app loads the German Credit dataset from OpenML. Click **Load Dataset & Train Models** on any tab to begin.
+The project ships with a **synthetic data generator** so everything trains immediately. A pure-NumPy model baseline is built in, and stronger libraries (scikit-learn / LightGBM / PyTorch / etc.) are used automatically when installed.
 
----
+## Use the real dataset
+1. Download from the data links above into `data/raw/`.
+2. Swap `make_synthetic()` for the `load_real(...)` helper in `src/data.py`.
+3. Re-run `python train.py`.
 
-## What This App Shows
+## Repo structure
+```
+DefaultRisk/
+  src/        core ML lib, data, model, evaluate, persist
+  train.py    end-to-end training entrypoint
+  app.py      streamlit demo
+  tests/      pytest smoke test
+  data/       put real datasets in data/raw/
+  models/     saved model + metrics (gitignored)
+  requirements.txt, README.md, LICENSE, Makefile
+```
 
-| Section | What It Covers |
-|---|---|
-| **Overview** | Credit risk context, Basel framework, PD modeling fundamentals |
-| **Data Explorer** | Default distributions, numeric and categorical feature analysis, correlations |
-| **Feature Engineering** | Leak-free encoding pipeline for mixed data types |
-| **Model Benchmarks** | LR vs RF vs LightGBM (5-fold CV), confusion matrices, McNemar test |
-| **Scorecard** | Score distribution, approval rates, gain/lift chart, cost optimization |
-| **Explainability** | SHAP global importance and per-prediction attribution |
-| **Model Card** | Documentation, intended use, limitations, monitoring plan |
-
----
-
-## Key Techniques
-
-- **PR-AUC** — ranking metric appropriate for imbalanced credit data
-- **Leak-free Pipeline** — sklearn `BaseEstimator` + `TransformerMixin` prevents data leakage
-- **Cost-Sensitive Threshold** — minimises expected loss from FN and FP decisions
-- **Probability Calibration** — isotonic regression for unbiased PD estimates
-- **SHAP Explainability** — Shapley values for regulatory compliance
-- **McNemar Test** — statistical significance between model pairs
-- **Gain/Lift Charts** — operational ranking performance evaluation
-
----
-
-## Tech Stack
-
-| Tool | Purpose |
-|---|---|
-| Python 3.11+ | Core language |
-| scikit-learn | Pipeline, models, CV, metrics |
-| LightGBM | Gradient boosting (champion model) |
-| SHAP | TreeExplainer for explainability |
-| Streamlit | Interactive dashboard |
-| Matplotlib + Seaborn | Static visualisations |
-| Plotly | Interactive charts |
-| OpenML | Dataset source |
-
----
+## Next steps to make it portfolio-grade
+- Replace synthetic data with the real dataset and re-tune.
+- Enable the optional libraries in `requirements.txt` for SOTA models.
+- Add cross-validation, hyperparameter search, and CI.
+- Deploy the streamlit app (Streamlit Community Cloud / Hugging Face Spaces).
 
 ## License
-
 MIT
-
----
-
-## Acknowledgements
-
-- **German Credit Dataset** (UCI Machine Learning Repository)
-- Inspired by credit risk modeling practices in retail banking
