@@ -264,13 +264,108 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📖 Methodology & Overview",
     "📊 Loan Portfolio Explorer",
     "🔬 Credit Risk Factors",
     "🤖 Model Training & Scorecard",
     "📋 Scorecard & Scorepoints",
     "💰 Portfolio Risk & Capital",
 ])
+
+# ───────────────────────────────────────────────
+# TAB 0 — METHODOLOGY & OVERVIEW
+# ───────────────────────────────────────────────
+with tab0:
+    st.header("📖 Project Overview")
+    st.markdown("""
+    **DefaultRisk** is a credit-default prediction dashboard framed under
+    **Basel III / LendingClub** conventions. It demonstrates an end-to-end
+    risk-modelling workflow — synthetic data generation, feature engineering,
+    pure-NumPy logistic regression, model evaluation, scorecard construction,
+    and portfolio capital allocation — all inside an interactive Streamlit app.
+    """)
+
+    st.subheader("🎯 Objective")
+    st.markdown("""
+    Estimate **Probability of Default (PD)** for individual loans using 12 borrower
+    characteristics, then compute **Expected Loss (EL)** via
+    $EL = PD \\times LGD \\times EAD$, and determine regulatory capital
+    ratios (Tier 1, Total Capital, RAROC) under a simplified Basel III framework.
+    """)
+
+    st.subheader("📦 Data")
+    st.markdown("""
+    **30 000 synthetic loans** generated from parametric distributions
+    (log-normal for income/loan, beta for DTI, normal for credit score, etc.)
+    with a ~27 % default rate. No real borrower data is used — the app runs
+    fully self-contained for demonstration and portfolio-simulation purposes.
+    """)
+
+    st.subheader("⚙️ Methodology")
+
+    with st.expander("Feature Engineering"):
+        st.markdown("""
+        - **12 continuous/categorical raw features** (loan amount, interest rate,
+          term, income, DTI, credit score, employment length, open accounts,
+          derogatory marks, revolving utilization, inquiries, months since delinq).
+        - **4 one-hot derived flags**: `home_OWN`, `home_MORTGAGE`,
+          `purpose_debt_consolidation`, `purpose_business`.
+        - 16 total predictors after encoding. All numeric — no missing values
+          in the synthetic pipeline.
+        - **Weight of Evidence (WoE)** and **Information Value (IV)** computed
+          for monitoring feature strength (IV < 0.02 → useless; > 0.3 → strong).
+        """)
+
+    with st.expander("Model — Logistic Regression via SGD"):
+        st.markdown("""
+        - **Estimator**: $P(y=1 \\mid \\mathbf{x}) = \\sigma(\\mathbf{w}^\\top\\mathbf{x} + b)$
+        - **Loss**: Binary cross-entropy with **class-weight balancing**:
+          $$\\mathcal{L} = -\\frac{1}{N}\\sum_i w_i\\bigl[y_i\\log\\hat{p}_i+(1-y_i)\\log(1-\\hat{p}_i)\\bigr] + \\frac{\\lambda}{2}\\|\\mathbf{w}\\|^2$$
+          where $w_i = N/(2 \\times \\text{count}(y_i))$ down-weights the majority class.
+        - **Optimizer**: Mini-batch SGD (full-batch equivalent), learning rate 0.12,
+          350 epochs, L2 penalty $\\lambda = 0.001$, random normal init $\\mathcal{N}(0, 0.01)$.
+        - All implemented in **pure NumPy** — no scikit-learn or autodiff.
+        """)
+
+    with st.expander("Model Evaluation"):
+        st.markdown("""
+        - **ROC-AUC** (trapezoidal rule) — discriminatory power.
+        - **PR-AUC** — precision-recall trade-off on imbalanced data.
+        - **KS Statistic** — maximum separation between default / non-default CDFs.
+        - **Gini Coefficient** = $2 \\times \\text{AUC} - 1$.
+        - **Log Loss** — probabilistic calibration.
+        - **Brier Score** — mean squared error of predicted probabilities.
+        """)
+
+    with st.expander("Scorecard Construction"):
+        st.markdown("""
+        - **Base score**: 600, **scale**: 50 (every 50 points halves/halves the odds).
+        - **Score-to-odds**: $\\text{Score} = 600 - \\frac{50}{\\ln(2)}(\\mathbf{w}^\\top\\mathbf{x} + b)$.
+        - **Scorepoints per feature**: $\\text{Points}_i = -\\frac{50}{\\ln(2)} w_i x_i$, displayed
+          as a waterfall chart for each individual application.
+        - Factor = −50 / ln(2) ≈ −72.13.
+        """)
+
+    with st.expander("Portfolio Risk — Basel III"):
+        st.markdown("""
+        - **Expected Loss**: $EL = PD \\times LGD \\times EAD$.
+        - **Unexpected Loss (UL)**: $UL = \\text{Std}(\\text{loss}) \\times 2.58$ (99.5 % VaR equivalent).
+        - **Capital**:
+          - Tier 1 Capital = 6 % of RWA (Risk-Weighted Assets).
+          - Total Capital = 8 % of RWA.
+          - Economic Capital (EC) = $\\max(\\text{UL}, \\text{VaR}_{99.5\\%})$.
+        - **RAROC** = (Revenue − EL − OpCost) / EC.
+        - **PSI** tracks population drift between expected and actual score distributions.
+        """)
+
+    st.subheader("🔧 Tech Stack")
+    st.markdown("""
+    - **Python 3.11+**, NumPy, pandas, matplotlib, SciPy.
+    - **Streamlit** for the interactive dashboard.
+    - **LightGBM** available as an optional production backend (commented out).
+    - No deep learning, no GPU — everything runs CPU-only in seconds.
+    """)
 
 # ───────────────────────────────────────────────
 # TAB 1 — LOAN PORTFOLIO EXPLORER
