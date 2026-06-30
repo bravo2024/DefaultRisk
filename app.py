@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy.stats import norm as sp_norm
 
+try:
+    import lightgbm as lgb
+    _LGB_AVAILABLE = True
+except ImportError:
+    _LGB_AVAILABLE = False
+
 st.set_page_config(
     page_title="DefaultRisk — Credit Default Prediction",
     layout="wide",
@@ -30,6 +36,10 @@ with st.sidebar:
     pd_manual   = 0.15
     if pd_override:
         pd_manual = st.slider("Manual PD", 0.001, 0.999, 0.15, 0.001)
+    st.markdown("---")
+    model_choice = st.radio("Dashboard Model",
+        ["Logistic Regression", "LightGBM"] if _LGB_AVAILABLE else ["Logistic Regression"],
+        index=0)
     st.markdown("---")
     st.caption("All models: pure NumPy — no sklearn.")
 
@@ -216,9 +226,63 @@ def train_model(_df: pd.DataFrame) -> dict:
         brier=brier_fn(y_te, sc_te),
     )
 
+def classification_metrics(y_true, y_prob, t=0.5):
+    preds = (y_prob >= t).astype(int)
+    tp = int(((preds==1)&(y_true==1)).sum())
+    fp = int(((preds==1)&(y_true==0)).sum())
+    tn = int(((preds==0)&(y_true==0)).sum())
+    fn = int(((preds==0)&(y_true==1)).sum())
+    acc = (tp + tn) / max(tp+fp+tn+fn, 1)
+    prec = tp / max(tp+fp, 1)
+    rec = tp / max(tp+fn, 1)
+    f1 = 2 * prec * rec / max(prec + rec, 1e-9)
+    return dict(tp=tp, fp=fp, tn=tn, fn=fn,
+                accuracy=acc, precision=prec, recall=rec, f1=f1)
+
+@st.cache_resource(show_spinner=False)
+def train_lgb(_df: pd.DataFrame) -> dict:
+    X, feat_names = build_X(_df)
+    y = _df["default"].values.astype(float)
+
+    rng  = np.random.default_rng(7)
+    idx  = rng.permutation(len(X))
+    n_te = int(len(X) * 0.2)
+    X_tr, X_te = X[idx[n_te:]], X[idx[:n_te]]
+    y_tr, y_te = y[idx[n_te:]], y[idx[:n_te]]
+
+    X_tr_s, X_te_s, mu, sd = standardize(X_tr, X_te)
+
+    lgb_model = lgb.LGBMClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.1,
+        num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+        random_state=7, verbose=-1, force_col_wise=True,
+    )
+    lgb_model.fit(X_tr_s, y_tr)
+    sc_tr = lgb_model.predict_proba(X_tr_s)[:, 1]
+    sc_te = lgb_model.predict_proba(X_te_s)[:, 1]
+
+    fpr, tpr, auc  = manual_roc(y_te, sc_te)
+    rec, prec, prauc = manual_pr(y_te, sc_te)
+    cm = classification_metrics(y_te, sc_te, threshold)
+
+    return dict(
+        model=lgb_model, mu=mu, sd=sd, feat_names=feat_names,
+        X_tr=X_tr, X_te=X_te, y_tr=y_tr, y_te=y_te,
+        sc_tr=sc_tr, sc_te=sc_te,
+        fpr=fpr, tpr=tpr, auc=auc,
+        rec=rec, prec=prec, prauc=prauc,
+        ks=ks_stat(y_te, sc_te),
+        gini=2 * auc - 1,
+        ll=log_loss_fn(y_te, sc_te),
+        brier=brier_fn(y_te, sc_te),
+        cm=cm,
+    )
+
 def predict_pd(df_input: pd.DataFrame, mdl: dict) -> np.ndarray:
     X, _ = build_X(df_input)
     Xs   = (X - mdl["mu"]) / mdl["sd"]
+    if "model" in mdl:
+        return mdl["model"].predict_proba(Xs)[:, 1]
     return sigmoid(Xs @ mdl["w"] + mdl["b"])
 
 # ─────────────────────────────────────────────────────────────────
@@ -227,13 +291,21 @@ def predict_pd(df_input: pd.DataFrame, mdl: dict) -> np.ndarray:
 with st.spinner("Generating 30,000 synthetic loans..."):
     df = generate_loan_data(30_000)
 
-with st.spinner("Training credit model (NumPy SGD)..."):
+with st.spinner("Training Logistic Regression (NumPy SGD)..."):
     mdl = train_model(df)
+    mdl["cm"] = classification_metrics(mdl["y_te"], mdl["sc_te"], threshold)
+
+lgb_mdl = None
+if _LGB_AVAILABLE:
+    with st.spinner("Training LightGBM..."):
+        lgb_mdl = train_lgb(df)
+
+active_mdl = lgb_mdl if (model_choice == "LightGBM" and lgb_mdl is not None) else mdl
 
 # ─────────────────────────────────────────────────────────────────
 # HEADER METRICS
 # ─────────────────────────────────────────────────────────────────
-loan_pd_all  = predict_pd(df, mdl)
+loan_pd_all  = predict_pd(df, active_mdl)
 if pd_override:
     loan_pd_all = np.full(len(df), pd_manual)
 
@@ -249,8 +321,9 @@ op_cost  = revenue * 0.25
 ec_rough = total_el * 3
 raroc    = (revenue - total_el - op_cost) / max(ec_rough, 1)
 
+backend_label = "LightGBM" if (model_choice == "LightGBM" and lgb_mdl is not None) else "Logistic Regression (NumPy SGD)"
 st.title("DefaultRisk — Credit Default Prediction Platform")
-st.caption("LendingClub / Basel III Framing  |  Pure NumPy Logistic Regression  |  30,000 Synthetic Loans")
+st.caption(f"LendingClub / Basel III Framing  |  {backend_label}  |  30,000 Synthetic Loans")
 
 h = st.columns(6)
 h[0].metric("Total Loans",     f"{len(df):,}")
@@ -555,7 +628,7 @@ with tab2:
     cs_woe = cs_woe.sort_values("bin")
 
     # ── KS statistic
-    sc_all    = predict_pd(df, mdl)
+    sc_all    = predict_pd(df, active_mdl)
     y_all     = df["default"].values
     order_ks  = np.argsort(sc_all)
     ys_ks     = y_all[order_ks]
@@ -593,125 +666,169 @@ with tab2:
 with tab3:
     st.header("🤖 Model Training & Scorecard")
 
-    st.subheader("Logistic Regression via SGD")
+    st.subheader("Model Comparison — Logistic Regression vs LightGBM")
+
+    # ── Metrics comparison table ──
+    cm_lr = classification_metrics(mdl["y_te"], mdl["sc_te"], threshold)
+    cm_lgb = classification_metrics(lgb_mdl["y_te"], lgb_mdl["sc_te"], threshold) if lgb_mdl else None
+
+    comp_data = {
+        "Metric": ["ROC-AUC", "PR-AUC", "KS Stat", "Gini", "Log Loss", "Brier Score",
+                    "Accuracy", "Precision", "Recall", "F1 Score"],
+        "Logistic Regression": [
+            f"{mdl['auc']:.4f}", f"{mdl['prauc']:.4f}", f"{mdl['ks']:.4f}",
+            f"{mdl['gini']:.4f}", f"{mdl['ll']:.4f}", f"{mdl['brier']:.4f}",
+            f"{cm_lr['accuracy']:.4f}", f"{cm_lr['precision']:.4f}",
+            f"{cm_lr['recall']:.4f}", f"{cm_lr['f1']:.4f}",
+        ],
+    }
+    if cm_lgb:
+        comp_data["LightGBM"] = [
+            f"{lgb_mdl['auc']:.4f}", f"{lgb_mdl['prauc']:.4f}", f"{lgb_mdl['ks']:.4f}",
+            f"{lgb_mdl['gini']:.4f}", f"{lgb_mdl['ll']:.4f}", f"{lgb_mdl['brier']:.4f}",
+            f"{cm_lgb['accuracy']:.4f}", f"{cm_lgb['precision']:.4f}",
+            f"{cm_lgb['recall']:.4f}", f"{cm_lgb['f1']:.4f}",
+        ]
+
+    st.dataframe(pd.DataFrame(comp_data).set_index("Metric"), use_container_width=True)
+
+    # ── Side-by-side confusion matrices ──
+    cm1, cm2 = st.columns(2)
+    with cm1:
+        st.subheader("Logistic Regression — Confusion Matrix")
+        fig_lr, ax_lr = plt.subplots(figsize=(4, 3.5))
+        cm_arr_lr = np.array([[cm_lr['tn'], cm_lr['fp']], [cm_lr['fn'], cm_lr['tp']]])
+        ax_lr.imshow(cm_arr_lr, cmap="Blues")
+        ax_lr.set_xticks([0, 1]); ax_lr.set_yticks([0, 1])
+        ax_lr.set_xticklabels(["Pred: No", "Pred: Yes"], fontsize=8)
+        ax_lr.set_yticklabels(["Act: No", "Act: Yes"], fontsize=8)
+        for i in range(2):
+            for j in range(2):
+                ax_lr.text(j, i, str(cm_arr_lr[i, j]), ha="center", va="center", fontsize=12,
+                           color="white" if cm_arr_lr[i, j] > cm_arr_lr.max() / 2 else "black")
+        ax_lr.set_title(f"Threshold = {threshold:.2f}", fontweight="bold", fontsize=10)
+        st.pyplot(fig_lr); plt.close()
+
+    with cm2:
+        if lgb_mdl:
+            st.subheader("LightGBM — Confusion Matrix")
+            fig_lgb, ax_lgb = plt.subplots(figsize=(4, 3.5))
+            cm_arr_lgb = np.array([[cm_lgb['tn'], cm_lgb['fp']], [cm_lgb['fn'], cm_lgb['tp']]])
+            ax_lgb.imshow(cm_arr_lgb, cmap="Greens")
+            ax_lgb.set_xticks([0, 1]); ax_lgb.set_yticks([0, 1])
+            ax_lgb.set_xticklabels(["Pred: No", "Pred: Yes"], fontsize=8)
+            ax_lgb.set_yticklabels(["Act: No", "Act: Yes"], fontsize=8)
+            for i in range(2):
+                for j in range(2):
+                    ax_lgb.text(j, i, str(cm_arr_lgb[i, j]), ha="center", va="center", fontsize=12,
+                                color="white" if cm_arr_lgb[i, j] > cm_arr_lgb.max() / 2 else "black")
+            ax_lgb.set_title(f"Threshold = {threshold:.2f}", fontweight="bold", fontsize=10)
+            st.pyplot(fig_lgb); plt.close()
+        else:
+            st.info("Install LightGBM (`pip install lightgbm`) to see comparison.")
+
+    # ── Overlaid ROC & PR curves ──
+    fig2 = plt.figure(figsize=(14, 5))
+    gs2 = gridspec.GridSpec(1, 2, figure=fig2, wspace=0.35)
+
+    ax_roc = fig2.add_subplot(gs2[0, 0])
+    ax_roc.plot(mdl["fpr"], mdl["tpr"], color="crimson", lw=2,
+                label=f"LogReg AUC={mdl['auc']:.3f}")
+    if lgb_mdl:
+        ax_roc.plot(lgb_mdl["fpr"], lgb_mdl["tpr"], color="green", lw=2,
+                    label=f"LightGBM AUC={lgb_mdl['auc']:.3f}")
+    ax_roc.plot([0, 1], [0, 1], "k--", lw=1, label="Random")
+    ax_roc.set_title("ROC Curve — Overlay", fontweight="bold")
+    ax_roc.set_xlabel("FPR"); ax_roc.set_ylabel("TPR")
+    ax_roc.legend(fontsize=9); ax_roc.grid(alpha=0.3)
+
+    ax_pr = fig2.add_subplot(gs2[0, 1])
+    baseline = mdl["y_te"].mean()
+    ax_pr.plot(mdl["rec"], mdl["prec"], color="crimson", lw=2,
+               label=f"LogReg PR-AUC={mdl['prauc']:.3f}")
+    if lgb_mdl:
+        ax_pr.plot(lgb_mdl["rec"], lgb_mdl["prec"], color="green", lw=2,
+                   label=f"LightGBM PR-AUC={lgb_mdl['prauc']:.3f}")
+    ax_pr.axhline(baseline, color="gray", ls="--", lw=1, label=f"Baseline={baseline:.2f}")
+    ax_pr.set_title("Precision-Recall Curve — Overlay", fontweight="bold")
+    ax_pr.set_xlabel("Recall"); ax_pr.set_ylabel("Precision")
+    ax_pr.legend(fontsize=9); ax_pr.grid(alpha=0.3)
+
+    plt.tight_layout(); st.pyplot(fig2); plt.close()
+
+    # ── Score distribution side-by-side ──
+    fig3, (ax_s0, ax_s1) = plt.subplots(1, 2, figsize=(14, 4))
+    for ax, mod, label, color in [
+        (ax_s0, mdl, "Logistic Regression", "crimson"),
+        (ax_s1, lgb_mdl, "LightGBM", "green"),
+    ]:
+        if mod is None:
+            continue
+        s0_v = mod["sc_te"][mod["y_te"] == 0]
+        s1_v = mod["sc_te"][mod["y_te"] == 1]
+        ax.hist(s0_v, bins=50, alpha=0.6, color="steelblue", density=True, label="Non-Default")
+        ax.hist(s1_v, bins=50, alpha=0.6, color=color, density=True, label="Default")
+        ax.axvline(threshold, color="black", ls="--", lw=1.5, label=f"t={threshold}")
+        ax.set_title(f"{label} — Score Distribution", fontweight="bold")
+        ax.set_xlabel("Predicted PD"); ax.set_ylabel("Density")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    plt.tight_layout(); st.pyplot(fig3); plt.close()
+
+    # ── Calibration overlay ──
+    fig4, ax_cal = plt.subplots(figsize=(7, 5))
+    ax_cal.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect")
+    edges = np.linspace(0, 1, 11)
+    for mod, label, color, marker in [
+        (mdl, "Logistic Regression", "crimson", "o"),
+        (lgb_mdl, "LightGBM", "green", "s"),
+    ]:
+        if mod is None:
+            continue
+        frac_pos_cal, mean_pred_cal = [], []
+        for i in range(10):
+            mask = (mod["sc_te"] >= edges[i]) & (mod["sc_te"] < edges[i + 1])
+            if mask.sum() > 0:
+                frac_pos_cal.append(mod["y_te"][mask].mean())
+                mean_pred_cal.append(mod["sc_te"][mask].mean())
+        ax_cal.plot(mean_pred_cal, frac_pos_cal, marker=marker, color=color, lw=2, label=label)
+    ax_cal.set_title("Calibration Curve", fontweight="bold")
+    ax_cal.set_xlabel("Mean Predicted PD"); ax_cal.set_ylabel("Fraction Positive")
+    ax_cal.legend(fontsize=9); ax_cal.grid(alpha=0.3)
+    plt.tight_layout(); st.pyplot(fig4); plt.close()
+
+    st.subheader("Logistic Regression Formulation")
     st.latex(r"P(\text{default}=1\mid\mathbf{x}) = \sigma(\mathbf{w}^\top\mathbf{x}+b)"
              r"= \frac{1}{1+e^{-(\mathbf{w}^\top\mathbf{x}+b)}}")
     st.latex(r"\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}w_i"
              r"\bigl[y_i\log\hat{p}_i+(1-y_i)\log(1-\hat{p}_i)\bigr]"
              r"+\frac{\lambda}{2}\|\mathbf{w}\|^2")
+    if lgb_mdl:
+        st.subheader("LightGBM Parameters")
+        st.code(
+            f"n_estimators=200, max_depth=6, learning_rate=0.1,\n"
+            f"num_leaves=31, subsample=0.8, colsample_bytree=0.8",
+            language="text",
+        )
 
-    m_cols = st.columns(6)
-    m_cols[0].metric("ROC-AUC",    f"{mdl['auc']:.4f}")
-    m_cols[1].metric("PR-AUC",     f"{mdl['prauc']:.4f}")
-    m_cols[2].metric("Log Loss",   f"{mdl['ll']:.4f}")
-    m_cols[3].metric("KS Stat",    f"{mdl['ks']:.4f}")
-    m_cols[4].metric("Gini",       f"{mdl['gini']:.4f}")
-    m_cols[5].metric("Brier Score",f"{mdl['brier']:.4f}")
+    # ── Basel III Info (always from LR) ──
+    with st.expander("Basel III IRB Capital Calculation"):
+        st.latex(r"R = 0.12\,\frac{1-e^{-50\,PD}}{1-e^{-50}}"
+                 r"+ 0.24\!\left(1-\frac{1-e^{-50\,PD}}{1-e^{-50}}\right)")
+        st.latex(r"K = LGD\cdot N\!\left[\sqrt{\frac{1}{1-R}}\,G(PD)"
+                 r"+\sqrt{\frac{R}{1-R}}\,G(0.999)\right]-PD\cdot LGD")
+        st.latex(r"EL = PD\times LGD\times EAD")
+        st.latex(r"RWA = K\times 12.5\times EAD")
 
-    fig = plt.figure(figsize=(16, 10))
-    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
-
-    # ROC
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(mdl["fpr"], mdl["tpr"], color="crimson", lw=2,
-             label=f"AUC={mdl['auc']:.3f}")
-    ax1.plot([0,1],[0,1],"k--",lw=1, label="Random")
-    ax1.fill_between(mdl["fpr"], mdl["tpr"], alpha=0.12, color="crimson")
-    ax1.set_title("ROC Curve", fontweight="bold")
-    ax1.set_xlabel("FPR");  ax1.set_ylabel("TPR")
-    ax1.legend(fontsize=9);  ax1.grid(alpha=0.3)
-
-    # PR
-    ax2 = fig.add_subplot(gs[0, 1])
-    baseline = mdl["y_te"].mean()
-    ax2.plot(mdl["rec"], mdl["prec"], color="steelblue", lw=2,
-             label=f"AUC={mdl['prauc']:.3f}")
-    ax2.axhline(baseline, color="gray", ls="--", lw=1,
-                label=f"Baseline={baseline:.2f}")
-    ax2.set_title("Precision-Recall Curve", fontweight="bold")
-    ax2.set_xlabel("Recall");  ax2.set_ylabel("Precision")
-    ax2.legend(fontsize=9);  ax2.grid(alpha=0.3)
-
-    # Score distribution
-    ax3 = fig.add_subplot(gs[0, 2])
-    s0 = mdl["sc_te"][mdl["y_te"]==0]
-    s1 = mdl["sc_te"][mdl["y_te"]==1]
-    ax3.hist(s0, bins=50, alpha=0.6, color="steelblue", density=True, label="Non-Default")
-    ax3.hist(s1, bins=50, alpha=0.6, color="crimson",   density=True, label="Default")
-    ax3.axvline(threshold, color="black", ls="--", lw=1.5, label=f"t={threshold}")
-    ax3.set_title("Score Distribution (Test)", fontweight="bold")
-    ax3.set_xlabel("Predicted PD");  ax3.set_ylabel("Density")
-    ax3.legend(fontsize=9);  ax3.grid(alpha=0.3)
-
-    # Calibration
-    ax4 = fig.add_subplot(gs[1, 0])
-    edges = np.linspace(0, 1, 11)
-    frac_pos_cal, mean_pred_cal = [], []
-    for i in range(10):
-        mask = (mdl["sc_te"] >= edges[i]) & (mdl["sc_te"] < edges[i+1])
-        if mask.sum() > 0:
-            frac_pos_cal.append(mdl["y_te"][mask].mean())
-            mean_pred_cal.append(mdl["sc_te"][mask].mean())
-    ax4.plot([0,1],[0,1],"k--",lw=1, label="Perfect")
-    ax4.plot(mean_pred_cal, frac_pos_cal, "o-", color="steelblue", lw=2, label="Model")
-    ax4.set_title("Calibration Curve", fontweight="bold")
-    ax4.set_xlabel("Mean Predicted PD");  ax4.set_ylabel("Fraction Positive")
-    ax4.legend(fontsize=9);  ax4.grid(alpha=0.3)
-
-    # Confusion matrix
-    ax5 = fig.add_subplot(gs[1, 1])
-    preds = (mdl["sc_te"] >= threshold).astype(int)
-    tp = int(((preds==1)&(mdl["y_te"]==1)).sum())
-    fp = int(((preds==1)&(mdl["y_te"]==0)).sum())
-    tn = int(((preds==0)&(mdl["y_te"]==0)).sum())
-    fn = int(((preds==0)&(mdl["y_te"]==1)).sum())
-    cm = np.array([[tn,fp],[fn,tp]])
-    ax5.imshow(cm, cmap="Blues")
-    ax5.set_xticks([0,1]); ax5.set_yticks([0,1])
-    ax5.set_xticklabels(["Pred: No","Pred: Yes"], fontsize=9)
-    ax5.set_yticklabels(["Act: No","Act: Yes"],  fontsize=9)
-    for i in range(2):
-        for j in range(2):
-            ax5.text(j, i, str(cm[i,j]), ha="center", va="center", fontsize=13,
-                     color="white" if cm[i,j] > cm.max()/2 else "black")
-    prec_cm = tp / max(tp+fp, 1);  rec_cm = tp / max(tp+fn, 1)
-    ax5.set_title(f"Confusion Matrix  t={threshold:.2f}\nPrec={prec_cm:.2f}  Rec={rec_cm:.2f}",
-                  fontweight="bold")
-
-    # Basel info panel
-    ax6 = fig.add_subplot(gs[1, 2])
-    ax6.axis("off")
-    pd_b3 = pd_manual if pd_override else dr_mean
-    R_b3 = (0.12*(1-np.exp(-50*pd_b3))/(1-np.exp(-50))
-            + 0.24*(1-(1-np.exp(-50*pd_b3))/(1-np.exp(-50))))
-    K_b3 = (lgd * sp_norm.cdf(
-        np.sqrt(1/(1-R_b3))*sp_norm.ppf(pd_b3)
-        + np.sqrt(R_b3/(1-R_b3))*sp_norm.ppf(0.999)
-    ) - pd_b3 * lgd)
-    mean_ead = df["loan_amount"].mean() * ead_mult
-    rwa_b3   = K_b3 * 12.5 * mean_ead
-    lines = [
-        f"PD  = {pd_b3:.3%}",
-        f"LGD = {lgd:.0%}",
-        f"R   = {R_b3:.4f}",
-        f"K   = {K_b3:.4f}",
-        f"RWA = ${rwa_b3:,.0f}",
-        f"EL  = ${pd_b3*lgd*mean_ead:,.0f}",
-    ]
-    for i, ln in enumerate(lines):
-        ax6.text(0.05, 0.85 - i*0.14, ln, transform=ax6.transAxes, fontsize=10,
-                 fontfamily="monospace")
-    ax6.set_title("Basel III IRB Summary", fontweight="bold")
-
-    plt.tight_layout();  st.pyplot(fig);  plt.close()
-
-    st.subheader("Basel III IRB Capital Formulae")
-    st.latex(r"R = 0.12\,\frac{1-e^{-50\,PD}}{1-e^{-50}}"
-             r"+ 0.24\!\left(1-\frac{1-e^{-50\,PD}}{1-e^{-50}}\right)")
-    st.latex(r"K = LGD\cdot N\!\left[\sqrt{\frac{1}{1-R}}\,G(PD)"
-             r"+\sqrt{\frac{R}{1-R}}\,G(0.999)\right]-PD\cdot LGD")
-    st.latex(r"EL = PD\times LGD\times EAD")
-    st.latex(r"RWA = K\times 12.5\times EAD")
+        pd_b3 = pd_manual if pd_override else dr_mean
+        R_b3 = (0.12*(1-np.exp(-50*pd_b3))/(1-np.exp(-50))
+                + 0.24*(1-(1-np.exp(-50*pd_b3))/(1-np.exp(-50))))
+        K_b3 = (lgd * sp_norm.cdf(
+            np.sqrt(1/(1-R_b3))*sp_norm.ppf(pd_b3)
+            + np.sqrt(R_b3/(1-R_b3))*sp_norm.ppf(0.999)
+        ) - pd_b3 * lgd)
+        mean_ead = df["loan_amount"].mean() * ead_mult
+        rwa_b3 = K_b3 * 12.5 * mean_ead
+        st.metric("Risk-Weighted Assets (RWA)", f"${rwa_b3:,.0f}")
 
 # ───────────────────────────────────────────────
 # TAB 4 — SCORECARD & SCOREPOINTS
