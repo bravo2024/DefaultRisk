@@ -154,7 +154,7 @@ def manual_pr(y, scores, n_t=200):
         precs.append(tp / max(tp + fp, 1))
         recs.append(tp / max(pos, 1))
     rec  = np.array(recs[::-1]);  prec = np.array(precs[::-1])
-    return rec, prec, float(np.trapz(prec, rec))
+    return rec, prec, float(np.trapezoid(prec, rec))
 
 def ks_stat(y, scores):
     order    = np.argsort(scores)
