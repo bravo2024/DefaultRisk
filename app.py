@@ -48,7 +48,7 @@ with st.sidebar:
     else:
         dash_model = "Logistic Regression"
     st.markdown("---")
-    st.caption("All models: pure NumPy — no sklearn.")
+    st.caption("LR: pure NumPy SGD. LGB: lightgbm.")
 
 # ─────────────────────────────────────────────────────────────────
 # SYNTHETIC DATA
