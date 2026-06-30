@@ -722,7 +722,7 @@ with tab4:
         1.0 if sim_purp=="business" else 0.0,
     ]])
     sim_Xs      = (sim_vec - mdl["mu"]) / mdl["sd"]
-    sim_raw     = float(sim_Xs @ mdl["w"] + mdl["b"])
+    sim_raw     = (sim_Xs @ mdl["w"] + mdl["b"]).item()
     sim_pd_val  = float(sigmoid(np.array([sim_raw]))[0])
     sim_score_v = BASE_SCORE + sim_raw * scale
     sim_el      = sim_pd_val * lgd * sim_loan * ead_mult
