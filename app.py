@@ -11,12 +11,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy.stats import norm as sp_norm
+from src.model import build_knn_graph, GNNModel
+import torch.nn.functional as F
 
 try:
     import lightgbm as lgb
     _LGB_AVAILABLE = True
 except ImportError:
     _LGB_AVAILABLE = False
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
 st.set_page_config(
     page_title="DefaultRisk — Credit Default Prediction",
@@ -40,15 +48,16 @@ with st.sidebar:
     st.caption("Active Models")
     use_lr  = st.checkbox("Logistic Regression", value=True)
     use_lgb = st.checkbox("LightGBM", value=_LGB_AVAILABLE, disabled=not _LGB_AVAILABLE)
-    if _LGB_AVAILABLE and use_lr and use_lgb:
-        dash_model = st.radio("Dashboard model",
-            ["Logistic Regression", "LightGBM"], index=0, horizontal=True)
-    elif use_lgb:
-        dash_model = "LightGBM"
-    else:
-        dash_model = "Logistic Regression"
+    use_gnn = st.checkbox("GNN (arXiv:2605.12782)", value=_TORCH_AVAILABLE, disabled=not _TORCH_AVAILABLE)
+    model_opts = []
+    if use_lr:   model_opts.append("Logistic Regression")
+    if use_lgb:  model_opts.append("LightGBM")
+    if use_gnn:  model_opts.append("GNN (Graph Neural Network)")
+    dash_model = model_opts[0] if len(model_opts) == 1 else st.radio(
+        "Dashboard model", model_opts, index=0, horizontal=True,
+    )
     st.markdown("---")
-    st.caption("LR: pure NumPy SGD. LGB: lightgbm.")
+    st.caption("LR: NumPy SGD. LGB: lightgbm. GNN: 2-layer GCN (arXiv:2605.12782).")
 
 # ─────────────────────────────────────────────────────────────────
 # SYNTHETIC DATA
@@ -285,11 +294,107 @@ def train_lgb(_df: pd.DataFrame) -> dict:
         cm=cm,
     )
 
+@st.cache_resource(show_spinner=False)
+def train_gnn(_df: pd.DataFrame) -> dict:
+    if not _TORCH_AVAILABLE:
+        return {"error": "PyTorch not installed"}
+    # Subsample for graph training speed
+    sub_n = min(5000, len(_df))
+    sub_df = _df.sample(n=sub_n, random_state=7)
+
+    X_all, feat_names = build_X(sub_df)
+    y_all = sub_df["default"].values.astype(float)
+
+    rng  = np.random.default_rng(7)
+    idx  = rng.permutation(len(X_all))
+    n_te = int(len(X_all) * 0.2)
+    X_tr, X_te = X_all[idx[n_te:]], X_all[idx[:n_te]]
+    y_tr, y_te = y_all[idx[n_te:]], y_all[idx[:n_te]]
+
+    mu, sd = X_tr.mean(0), X_tr.std(0) + 1e-8
+    X_full_s = (X_all - mu) / sd
+    x_full = torch.tensor(X_full_s, dtype=torch.float)
+    edge_index, edge_weight = build_knn_graph(X_full_s, k=10)
+
+    n_all = len(X_all)
+    sort_idx = idx[n_te:]; sort_idx.sort()
+    tr_mask = torch.zeros(n_all, dtype=torch.bool)
+    tr_mask[sort_idx] = True
+    va_mask = ~tr_mask
+    y_t = torch.tensor(y_all, dtype=torch.float)
+
+    model = GNNModel(X_all.shape[1], hidden_dim=32)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=5e-4)
+    n_pos = max(int(y_t[tr_mask].sum()), 1)
+    n_neg = int(tr_mask.sum()) - n_pos
+    pos_weight = torch.tensor([n_neg / n_pos])
+
+    # Pre-filter training edges for struct loss
+    tr_idx_set = set(sort_idx.tolist())
+    ei_np = edge_index.numpy()
+    tr_edge_mask = np.array([
+        ei_np[0, e] in tr_idx_set and ei_np[1, e] in tr_idx_set
+        for e in range(ei_np.shape[1])
+    ])
+    train_ei = edge_index[:, torch.tensor(tr_edge_mask)]
+
+    best_val = float("inf")
+    best_state = None
+    for epoch in range(80):
+        model.train()
+        logits = model(x_full, edge_index, edge_weight)
+        sup = F.binary_cross_entropy_with_logits(logits[tr_mask], y_t[tr_mask], pos_weight=pos_weight)
+        h1 = model.conv1(x_full, edge_index, edge_weight)
+        struct = model.structural_consistency(F.relu(h1), train_ei)
+        loss = sup + 0.1 * struct
+        opt.zero_grad(); loss.backward(); opt.step()
+        model.eval()
+        with torch.no_grad():
+            vl = F.binary_cross_entropy_with_logits(logits[va_mask], y_t[va_mask]).item()
+        if vl < best_val:
+            best_val = vl
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    assert best_state is not None
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        logits = model(x_full, edge_index, edge_weight)
+        sc_te = torch.sigmoid(logits[va_mask]).numpy()
+
+    fpr, tpr, auc  = manual_roc(y_te, sc_te)
+    rec, prec, prauc = manual_pr(y_te, sc_te)
+    cm = classification_metrics(y_te, sc_te, threshold)
+
+    return dict(
+        model=model, mu=mu, sd=sd, feat_names=feat_names,
+        X_tr=X_tr, X_te=X_te, y_tr=y_tr, y_te=y_te,
+        sc_tr=np.zeros(0), sc_te=sc_te,
+        fpr=fpr, tpr=tpr, auc=auc,
+        rec=rec, prec=prec, prauc=prauc,
+        ks=ks_stat(y_te, sc_te),
+        gini=2 * auc - 1,
+        ll=log_loss_fn(y_te, sc_te),
+        brier=brier_fn(y_te, sc_te),
+        cm=cm,
+    )
+
+
 def predict_pd(df_input: pd.DataFrame, mdl: dict) -> np.ndarray:
     X, _ = build_X(df_input)
-    Xs   = (X - mdl["mu"]) / mdl["sd"]
-    if "model" in mdl:
+    if "model" in mdl and hasattr(mdl["model"], "predict_proba"):
+        # LightGBM
+        Xs = (X - mdl["mu"]) / mdl["sd"]
         return mdl["model"].predict_proba(Xs)[:, 1]
+    if "model" in mdl and hasattr(mdl["model"], "mlp_forward"):
+        # GNN
+        Xs = (X - mdl["mu"]) / mdl["sd"]
+        x_t = torch.tensor(Xs, dtype=torch.float)
+        mdl["model"].eval()
+        with torch.no_grad():
+            return torch.sigmoid(mdl["model"].mlp_forward(x_t)).numpy()
+    # Logistic Regression
+    Xs = (X - mdl["mu"]) / mdl["sd"]
     return sigmoid(Xs @ mdl["w"] + mdl["b"])
 
 # ─────────────────────────────────────────────────────────────────
@@ -298,16 +403,20 @@ def predict_pd(df_input: pd.DataFrame, mdl: dict) -> np.ndarray:
 with st.spinner("Generating 30,000 synthetic loans..."):
     df = generate_loan_data(30_000)
 
-mdl = lgb_mdl = None
-if use_lr or not _LGB_AVAILABLE:
+mdl = lgb_mdl = gnn_mdl = None
+if use_lr or not (_LGB_AVAILABLE or _TORCH_AVAILABLE):
     with st.spinner("Training Logistic Regression (NumPy SGD)..."):
         mdl = train_model(df)
         mdl["cm"] = classification_metrics(mdl["y_te"], mdl["sc_te"], threshold)
 if use_lgb and _LGB_AVAILABLE:
     with st.spinner("Training LightGBM..."):
         lgb_mdl = train_lgb(df)
+if use_gnn and _TORCH_AVAILABLE:
+    with st.spinner("Training GNN (arXiv:2605.12782)..."):
+        gnn_mdl = train_gnn(df)
 
-active_mdl = lgb_mdl if (dash_model == "LightGBM" and lgb_mdl is not None) else mdl
+active_mdl = lgb_mdl if (dash_model == "LightGBM" and lgb_mdl is not None) else \
+             gnn_mdl if (dash_model == "GNN (Graph Neural Network)" and gnn_mdl is not None) else mdl
 
 # ─────────────────────────────────────────────────────────────────
 # HEADER METRICS
@@ -333,6 +442,8 @@ if mdl is not None:
     active_labels.append("Logistic Regression")
 if lgb_mdl is not None:
     active_labels.append("LightGBM")
+if gnn_mdl is not None:
+    active_labels.append("GNN")
 backend_label = " + ".join(active_labels) if len(active_labels) > 1 else active_labels[0]
 dash_label = f"{dash_model} (active)" if len(active_labels) > 1 else backend_label
 st.title("DefaultRisk — Credit Default Prediction Platform")
@@ -449,8 +560,8 @@ with tab0:
     st.markdown("""
     - **Python 3.11+**, NumPy, pandas, matplotlib, SciPy.
     - **Streamlit** for the interactive dashboard.
-    - **LightGBM** available as an optional production backend (commented out).
-    - No deep learning, no GPU — everything runs CPU-only in seconds.
+    - **LightGBM** available as an optional production backend.
+    - **PyTorch GNN** (2-layer GCN, arXiv:2605.12782) for graph-based credit risk modelling.
     """)
 
 # ───────────────────────────────────────────────
@@ -680,7 +791,8 @@ with tab3:
     st.header("🤖 Model Training & Scorecard")
 
     models_avail = [(mdl, "Logistic Regression", "crimson", "Blues"),
-                    (lgb_mdl, "LightGBM", "green", "Greens")]
+                    (lgb_mdl, "LightGBM", "green", "Greens"),
+                    (gnn_mdl, "GNN", "purple", "Purples")]
     models_avail = [(m, l, c, cmap) for m, l, c, cmap in models_avail if m is not None]
 
     if len(models_avail) == 0:
@@ -793,6 +905,14 @@ with tab3:
             f"num_leaves=31, subsample=0.8, colsample_bytree=0.8",
             language="text",
         )
+    if gnn_mdl:
+        st.subheader("GNN Architecture (arXiv:2605.12782)")
+        st.markdown("""
+        - **Graph**: k-NN similarity graph (k=15, cosine distance) on standardised features.
+        - **Encoder**: 2-layer GCN with symmetric normalisation (hidden dim=64).
+        - **Regularisation**: Structural consistency loss (cosine-similarity on connected nodes).
+        - **Inference**: MLP sub-network for out-of-sample loans; full graph for in-sample.
+        """)
 
     # ── Basel III Info (always from LR) ──
     with st.expander("Basel III IRB Capital Calculation"):
