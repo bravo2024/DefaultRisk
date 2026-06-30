@@ -37,9 +37,16 @@ with st.sidebar:
     if pd_override:
         pd_manual = st.slider("Manual PD", 0.001, 0.999, 0.15, 0.001)
     st.markdown("---")
-    model_choice = st.radio("Dashboard Model",
-        ["Logistic Regression", "LightGBM"] if _LGB_AVAILABLE else ["Logistic Regression"],
-        index=0)
+    st.caption("Active Models")
+    use_lr  = st.checkbox("Logistic Regression", value=True)
+    use_lgb = st.checkbox("LightGBM", value=_LGB_AVAILABLE, disabled=not _LGB_AVAILABLE)
+    if _LGB_AVAILABLE and use_lr and use_lgb:
+        dash_model = st.radio("Dashboard model",
+            ["Logistic Regression", "LightGBM"], index=0, horizontal=True)
+    elif use_lgb:
+        dash_model = "LightGBM"
+    else:
+        dash_model = "Logistic Regression"
     st.markdown("---")
     st.caption("All models: pure NumPy — no sklearn.")
 
@@ -291,16 +298,16 @@ def predict_pd(df_input: pd.DataFrame, mdl: dict) -> np.ndarray:
 with st.spinner("Generating 30,000 synthetic loans..."):
     df = generate_loan_data(30_000)
 
-with st.spinner("Training Logistic Regression (NumPy SGD)..."):
-    mdl = train_model(df)
-    mdl["cm"] = classification_metrics(mdl["y_te"], mdl["sc_te"], threshold)
-
-lgb_mdl = None
-if _LGB_AVAILABLE:
+mdl = lgb_mdl = None
+if use_lr or not _LGB_AVAILABLE:
+    with st.spinner("Training Logistic Regression (NumPy SGD)..."):
+        mdl = train_model(df)
+        mdl["cm"] = classification_metrics(mdl["y_te"], mdl["sc_te"], threshold)
+if use_lgb and _LGB_AVAILABLE:
     with st.spinner("Training LightGBM..."):
         lgb_mdl = train_lgb(df)
 
-active_mdl = lgb_mdl if (model_choice == "LightGBM" and lgb_mdl is not None) else mdl
+active_mdl = lgb_mdl if (dash_model == "LightGBM" and lgb_mdl is not None) else mdl
 
 # ─────────────────────────────────────────────────────────────────
 # HEADER METRICS
@@ -321,9 +328,15 @@ op_cost  = revenue * 0.25
 ec_rough = total_el * 3
 raroc    = (revenue - total_el - op_cost) / max(ec_rough, 1)
 
-backend_label = "LightGBM" if (model_choice == "LightGBM" and lgb_mdl is not None) else "Logistic Regression (NumPy SGD)"
+active_labels = []
+if mdl is not None:
+    active_labels.append("Logistic Regression")
+if lgb_mdl is not None:
+    active_labels.append("LightGBM")
+backend_label = " + ".join(active_labels) if len(active_labels) > 1 else active_labels[0]
+dash_label = f"{dash_model} (active)" if len(active_labels) > 1 else backend_label
 st.title("DefaultRisk — Credit Default Prediction Platform")
-st.caption(f"LendingClub / Basel III Framing  |  {backend_label}  |  30,000 Synthetic Loans")
+st.caption(f"LendingClub / Basel III Framing  |  {dash_label}  |  30,000 Synthetic Loans")
 
 h = st.columns(6)
 h[0].metric("Total Loans",     f"{len(df):,}")
@@ -666,135 +679,106 @@ with tab2:
 with tab3:
     st.header("🤖 Model Training & Scorecard")
 
-    st.subheader("Model Comparison — Logistic Regression vs LightGBM")
+    models_avail = [(mdl, "Logistic Regression", "crimson", "Blues"),
+                    (lgb_mdl, "LightGBM", "green", "Greens")]
+    models_avail = [(m, l, c, cmap) for m, l, c, cmap in models_avail if m is not None]
 
-    # ── Metrics comparison table ──
-    cm_lr = classification_metrics(mdl["y_te"], mdl["sc_te"], threshold)
-    cm_lgb = classification_metrics(lgb_mdl["y_te"], lgb_mdl["sc_te"], threshold) if lgb_mdl else None
+    if len(models_avail) == 0:
+        st.warning("No models trained. Enable at least one model in the sidebar.")
+    else:
+        st.subheader("Model Comparison — " + " vs ".join(label for _, label, _, _ in models_avail))
 
-    comp_data = {
-        "Metric": ["ROC-AUC", "PR-AUC", "KS Stat", "Gini", "Log Loss", "Brier Score",
-                    "Accuracy", "Precision", "Recall", "F1 Score"],
-        "Logistic Regression": [
-            f"{mdl['auc']:.4f}", f"{mdl['prauc']:.4f}", f"{mdl['ks']:.4f}",
-            f"{mdl['gini']:.4f}", f"{mdl['ll']:.4f}", f"{mdl['brier']:.4f}",
-            f"{cm_lr['accuracy']:.4f}", f"{cm_lr['precision']:.4f}",
-            f"{cm_lr['recall']:.4f}", f"{cm_lr['f1']:.4f}",
-        ],
-    }
-    if cm_lgb:
-        comp_data["LightGBM"] = [
-            f"{lgb_mdl['auc']:.4f}", f"{lgb_mdl['prauc']:.4f}", f"{lgb_mdl['ks']:.4f}",
-            f"{lgb_mdl['gini']:.4f}", f"{lgb_mdl['ll']:.4f}", f"{lgb_mdl['brier']:.4f}",
-            f"{cm_lgb['accuracy']:.4f}", f"{cm_lgb['precision']:.4f}",
-            f"{cm_lgb['recall']:.4f}", f"{cm_lgb['f1']:.4f}",
-        ]
+        # ── Metrics comparison table ──
+        comp_data = {
+            "Metric": ["ROC-AUC", "PR-AUC", "KS Stat", "Gini", "Log Loss", "Brier Score",
+                        "Accuracy", "Precision", "Recall", "F1 Score"],
+        }
+        for mod, label, _, _ in models_avail:
+            cm = classification_metrics(mod["y_te"], mod["sc_te"], threshold)
+            comp_data[label] = [
+                f"{mod['auc']:.4f}", f"{mod['prauc']:.4f}", f"{mod['ks']:.4f}",
+                f"{mod['gini']:.4f}", f"{mod['ll']:.4f}", f"{mod['brier']:.4f}",
+                f"{cm['accuracy']:.4f}", f"{cm['precision']:.4f}",
+                f"{cm['recall']:.4f}", f"{cm['f1']:.4f}",
+            ]
 
-    st.dataframe(pd.DataFrame(comp_data).set_index("Metric"), use_container_width=True)
+        st.dataframe(pd.DataFrame(comp_data).set_index("Metric"), use_container_width=True)
 
-    # ── Side-by-side confusion matrices ──
-    cm1, cm2 = st.columns(2)
-    with cm1:
-        st.subheader("Logistic Regression — Confusion Matrix")
-        fig_lr, ax_lr = plt.subplots(figsize=(4, 3.5))
-        cm_arr_lr = np.array([[cm_lr['tn'], cm_lr['fp']], [cm_lr['fn'], cm_lr['tp']]])
-        ax_lr.imshow(cm_arr_lr, cmap="Blues")
-        ax_lr.set_xticks([0, 1]); ax_lr.set_yticks([0, 1])
-        ax_lr.set_xticklabels(["Pred: No", "Pred: Yes"], fontsize=8)
-        ax_lr.set_yticklabels(["Act: No", "Act: Yes"], fontsize=8)
-        for i in range(2):
-            for j in range(2):
-                ax_lr.text(j, i, str(cm_arr_lr[i, j]), ha="center", va="center", fontsize=12,
-                           color="white" if cm_arr_lr[i, j] > cm_arr_lr.max() / 2 else "black")
-        ax_lr.set_title(f"Threshold = {threshold:.2f}", fontweight="bold", fontsize=10)
-        st.pyplot(fig_lr); plt.close()
+        # ── Confusion matrices side-by-side ──
+        conf_cols = st.columns(len(models_avail))
+        for ci, (mod, label, _, cmap) in enumerate(models_avail):
+            with conf_cols[ci]:
+                cm_res = classification_metrics(mod["y_te"], mod["sc_te"], threshold)
+                st.subheader(f"{label} — Confusion Matrix")
+                fig_c, ax_c = plt.subplots(figsize=(4, 3.5))
+                cm_arr = np.array([[cm_res['tn'], cm_res['fp']], [cm_res['fn'], cm_res['tp']]])
+                ax_c.imshow(cm_arr, cmap=cmap)
+                ax_c.set_xticks([0, 1]); ax_c.set_yticks([0, 1])
+                ax_c.set_xticklabels(["Pred: No", "Pred: Yes"], fontsize=8)
+                ax_c.set_yticklabels(["Act: No", "Act: Yes"], fontsize=8)
+                for i in range(2):
+                    for j in range(2):
+                        ax_c.text(j, i, str(cm_arr[i, j]), ha="center", va="center", fontsize=12,
+                                  color="white" if cm_arr[i, j] > cm_arr.max() / 2 else "black")
+                ax_c.set_title(f"Threshold = {threshold:.2f}", fontweight="bold", fontsize=10)
+                st.pyplot(fig_c); plt.close()
 
-    with cm2:
-        if lgb_mdl:
-            st.subheader("LightGBM — Confusion Matrix")
-            fig_lgb, ax_lgb = plt.subplots(figsize=(4, 3.5))
-            cm_arr_lgb = np.array([[cm_lgb['tn'], cm_lgb['fp']], [cm_lgb['fn'], cm_lgb['tp']]])
-            ax_lgb.imshow(cm_arr_lgb, cmap="Greens")
-            ax_lgb.set_xticks([0, 1]); ax_lgb.set_yticks([0, 1])
-            ax_lgb.set_xticklabels(["Pred: No", "Pred: Yes"], fontsize=8)
-            ax_lgb.set_yticklabels(["Act: No", "Act: Yes"], fontsize=8)
-            for i in range(2):
-                for j in range(2):
-                    ax_lgb.text(j, i, str(cm_arr_lgb[i, j]), ha="center", va="center", fontsize=12,
-                                color="white" if cm_arr_lgb[i, j] > cm_arr_lgb.max() / 2 else "black")
-            ax_lgb.set_title(f"Threshold = {threshold:.2f}", fontweight="bold", fontsize=10)
-            st.pyplot(fig_lgb); plt.close()
-        else:
-            st.info("Install LightGBM (`pip install lightgbm`) to see comparison.")
+        # ── Overlaid ROC & PR curves ──
+        fig2 = plt.figure(figsize=(14, 5))
+        gs2 = gridspec.GridSpec(1, 2, figure=fig2, wspace=0.35)
 
-    # ── Overlaid ROC & PR curves ──
-    fig2 = plt.figure(figsize=(14, 5))
-    gs2 = gridspec.GridSpec(1, 2, figure=fig2, wspace=0.35)
+        ax_roc = fig2.add_subplot(gs2[0, 0])
+        for mod, label, color, _ in models_avail:
+            ax_roc.plot(mod["fpr"], mod["tpr"], color=color, lw=2,
+                        label=f"{label} AUC={mod['auc']:.3f}")
+        ax_roc.plot([0, 1], [0, 1], "k--", lw=1, label="Random")
+        ax_roc.set_title("ROC Curve — Overlay", fontweight="bold")
+        ax_roc.set_xlabel("FPR"); ax_roc.set_ylabel("TPR")
+        ax_roc.legend(fontsize=9); ax_roc.grid(alpha=0.3)
 
-    ax_roc = fig2.add_subplot(gs2[0, 0])
-    ax_roc.plot(mdl["fpr"], mdl["tpr"], color="crimson", lw=2,
-                label=f"LogReg AUC={mdl['auc']:.3f}")
-    if lgb_mdl:
-        ax_roc.plot(lgb_mdl["fpr"], lgb_mdl["tpr"], color="green", lw=2,
-                    label=f"LightGBM AUC={lgb_mdl['auc']:.3f}")
-    ax_roc.plot([0, 1], [0, 1], "k--", lw=1, label="Random")
-    ax_roc.set_title("ROC Curve — Overlay", fontweight="bold")
-    ax_roc.set_xlabel("FPR"); ax_roc.set_ylabel("TPR")
-    ax_roc.legend(fontsize=9); ax_roc.grid(alpha=0.3)
+        ax_pr = fig2.add_subplot(gs2[0, 1])
+        baseline = models_avail[0][0]["y_te"].mean()
+        for mod, label, color, _ in models_avail:
+            ax_pr.plot(mod["rec"], mod["prec"], color=color, lw=2,
+                       label=f"{label} PR-AUC={mod['prauc']:.3f}")
+        ax_pr.axhline(baseline, color="gray", ls="--", lw=1, label=f"Baseline={baseline:.2f}")
+        ax_pr.set_title("Precision-Recall Curve — Overlay", fontweight="bold")
+        ax_pr.set_xlabel("Recall"); ax_pr.set_ylabel("Precision")
+        ax_pr.legend(fontsize=9); ax_pr.grid(alpha=0.3)
 
-    ax_pr = fig2.add_subplot(gs2[0, 1])
-    baseline = mdl["y_te"].mean()
-    ax_pr.plot(mdl["rec"], mdl["prec"], color="crimson", lw=2,
-               label=f"LogReg PR-AUC={mdl['prauc']:.3f}")
-    if lgb_mdl:
-        ax_pr.plot(lgb_mdl["rec"], lgb_mdl["prec"], color="green", lw=2,
-                   label=f"LightGBM PR-AUC={lgb_mdl['prauc']:.3f}")
-    ax_pr.axhline(baseline, color="gray", ls="--", lw=1, label=f"Baseline={baseline:.2f}")
-    ax_pr.set_title("Precision-Recall Curve — Overlay", fontweight="bold")
-    ax_pr.set_xlabel("Recall"); ax_pr.set_ylabel("Precision")
-    ax_pr.legend(fontsize=9); ax_pr.grid(alpha=0.3)
+        plt.tight_layout(); st.pyplot(fig2); plt.close()
 
-    plt.tight_layout(); st.pyplot(fig2); plt.close()
+        # ── Score distributions ──
+        n_mods = len(models_avail)
+        fig3, axes = plt.subplots(1, n_mods, figsize=(14, 4), squeeze=False)
+        for ai, (mod, label, color, _) in enumerate(models_avail):
+            ax = axes[0, ai]
+            s0_v = mod["sc_te"][mod["y_te"] == 0]
+            s1_v = mod["sc_te"][mod["y_te"] == 1]
+            ax.hist(s0_v, bins=50, alpha=0.6, color="steelblue", density=True, label="Non-Default")
+            ax.hist(s1_v, bins=50, alpha=0.6, color=color, density=True, label="Default")
+            ax.axvline(threshold, color="black", ls="--", lw=1.5, label=f"t={threshold}")
+            ax.set_title(f"{label} — Score Distribution", fontweight="bold")
+            ax.set_xlabel("Predicted PD"); ax.set_ylabel("Density")
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        plt.tight_layout(); st.pyplot(fig3); plt.close()
 
-    # ── Score distribution side-by-side ──
-    fig3, (ax_s0, ax_s1) = plt.subplots(1, 2, figsize=(14, 4))
-    for ax, mod, label, color in [
-        (ax_s0, mdl, "Logistic Regression", "crimson"),
-        (ax_s1, lgb_mdl, "LightGBM", "green"),
-    ]:
-        if mod is None:
-            continue
-        s0_v = mod["sc_te"][mod["y_te"] == 0]
-        s1_v = mod["sc_te"][mod["y_te"] == 1]
-        ax.hist(s0_v, bins=50, alpha=0.6, color="steelblue", density=True, label="Non-Default")
-        ax.hist(s1_v, bins=50, alpha=0.6, color=color, density=True, label="Default")
-        ax.axvline(threshold, color="black", ls="--", lw=1.5, label=f"t={threshold}")
-        ax.set_title(f"{label} — Score Distribution", fontweight="bold")
-        ax.set_xlabel("Predicted PD"); ax.set_ylabel("Density")
-        ax.legend(fontsize=8); ax.grid(alpha=0.3)
-    plt.tight_layout(); st.pyplot(fig3); plt.close()
-
-    # ── Calibration overlay ──
-    fig4, ax_cal = plt.subplots(figsize=(7, 5))
-    ax_cal.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect")
-    edges = np.linspace(0, 1, 11)
-    for mod, label, color, marker in [
-        (mdl, "Logistic Regression", "crimson", "o"),
-        (lgb_mdl, "LightGBM", "green", "s"),
-    ]:
-        if mod is None:
-            continue
-        frac_pos_cal, mean_pred_cal = [], []
-        for i in range(10):
-            mask = (mod["sc_te"] >= edges[i]) & (mod["sc_te"] < edges[i + 1])
-            if mask.sum() > 0:
-                frac_pos_cal.append(mod["y_te"][mask].mean())
-                mean_pred_cal.append(mod["sc_te"][mask].mean())
-        ax_cal.plot(mean_pred_cal, frac_pos_cal, marker=marker, color=color, lw=2, label=label)
-    ax_cal.set_title("Calibration Curve", fontweight="bold")
-    ax_cal.set_xlabel("Mean Predicted PD"); ax_cal.set_ylabel("Fraction Positive")
-    ax_cal.legend(fontsize=9); ax_cal.grid(alpha=0.3)
-    plt.tight_layout(); st.pyplot(fig4); plt.close()
+        # ── Calibration overlay ──
+        fig4, ax_cal = plt.subplots(figsize=(7, 5))
+        ax_cal.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect")
+        edges = np.linspace(0, 1, 11)
+        for mod, label, color, _ in models_avail:
+            frac_pos_cal, mean_pred_cal = [], []
+            for i in range(10):
+                mask = (mod["sc_te"] >= edges[i]) & (mod["sc_te"] < edges[i + 1])
+                if mask.sum() > 0:
+                    frac_pos_cal.append(mod["y_te"][mask].mean())
+                    mean_pred_cal.append(mod["sc_te"][mask].mean())
+            ax_cal.plot(mean_pred_cal, frac_pos_cal, "o-", color=color, lw=2, label=label)
+        ax_cal.set_title("Calibration Curve", fontweight="bold")
+        ax_cal.set_xlabel("Mean Predicted PD"); ax_cal.set_ylabel("Fraction Positive")
+        ax_cal.legend(fontsize=9); ax_cal.grid(alpha=0.3)
+        plt.tight_layout(); st.pyplot(fig4); plt.close()
 
     st.subheader("Logistic Regression Formulation")
     st.latex(r"P(\text{default}=1\mid\mathbf{x}) = \sigma(\mathbf{w}^\top\mathbf{x}+b)"
@@ -834,6 +818,9 @@ with tab3:
 # TAB 4 — SCORECARD & SCOREPOINTS
 # ───────────────────────────────────────────────
 with tab4:
+    if mdl is None:
+        st.warning("Logistic Regression must be enabled for the Scorecard tab. Enable it in the sidebar.")
+        st.stop()
     st.header("📋 Scorecard & Scorepoints")
 
     BASE_SCORE = 600;  PDO = 20
@@ -956,6 +943,9 @@ with tab4:
 # TAB 5 — PORTFOLIO RISK & CAPITAL
 # ───────────────────────────────────────────────
 with tab5:
+    if active_mdl is None:
+        st.warning("Enable at least one model in the sidebar to view Portfolio Risk.")
+        st.stop()
     st.header("💰 Portfolio Risk & Capital")
 
     st.latex(r"EL = PD\times LGD\times EAD")
