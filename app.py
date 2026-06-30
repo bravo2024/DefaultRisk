@@ -141,7 +141,7 @@ def manual_roc(y, scores, n_t=200):
         tprs.append(tp / max(pos, 1))
         fprs.append(fp / max(neg, 1))
     fpr = np.array(fprs[::-1]);  tpr = np.array(tprs[::-1])
-    return fpr, tpr, float(np.trapz(tpr, fpr))
+    return fpr, tpr, float(np.trapezoid(tpr, fpr))
 
 def manual_pr(y, scores, n_t=200):
     thresholds = np.linspace(0, 1, n_t)
