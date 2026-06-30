@@ -1,1560 +1,900 @@
-"""DefaultRisk — Credit Card Default Prediction (Indian Context).
-   Self-contained Streamlit app for Streamlit Cloud deployment."""
+"""
+DefaultRisk — Credit Default Prediction Dashboard
+LendingClub / Basel III Framing | Pure NumPy | 30,000 Synthetic Loans
+"""
+import warnings
+warnings.filterwarnings("ignore")
 
-import sys, os, json, warnings, io, base64
-from pathlib import Path
-from datetime import datetime
-from functools import lru_cache
-
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve
-from sklearn.metrics import (
-    average_precision_score, roc_auc_score, f1_score,
-    precision_score, recall_score, confusion_matrix,
-    precision_recall_curve, roc_curve, brier_score_loss
-)
-from scipy.stats import chi2
-
-try:
-    import lightgbm as lgb
-    HAS_LGB = True
-except ImportError:
-    HAS_LGB = False
-
-try:
-    import shap
-    HAS_SHAP = True
-except ImportError:
-    HAS_SHAP = False
-
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    HAS_PLOTLY = True
-except ImportError:
-    HAS_PLOTLY = False
+import matplotlib.gridspec as gridspec
+from scipy.stats import norm as sp_norm
 
 st.set_page_config(
-    page_title="DefaultRisk — Credit Card Default Prediction (India)",
-    page_icon="\U0001f3e6",
+    page_title="DefaultRisk — Credit Default Prediction",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-defaults = {
-    "data_loaded": False,
-    "dataset_name": "UCI Credit Card (Taiwan)",
-    "dataset_error": None,
-    "df": None,
-    "results": None,
-    "y_test": None,
-    "X_test": None,
-    "models": None,
-    "cv_results": None,
-    "sel_Logistic Regression": True,
-    "sel_Random Forest": True,
-    "sel_LightGBM (Calibrated)": True,
-    "decision_threshold": 0.5,
-    "loading": False,
-    "abort": False,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# ─────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Global Controls")
+    threshold  = st.slider("Decision Threshold",   0.01, 0.99, 0.50, 0.01)
+    lgd        = st.slider("LGD (Loss Given Default)", 0.01, 1.00, 0.45, 0.01)
+    ead_mult   = st.slider("EAD Multiplier",       0.50, 2.00, 1.00, 0.05)
+    pd_override = st.checkbox("Override PD with manual value")
+    pd_manual   = 0.15
+    if pd_override:
+        pd_manual = st.slider("Manual PD", 0.001, 0.999, 0.15, 0.001)
+    st.markdown("---")
+    st.caption("All models: pure NumPy — no sklearn.")
 
-st.markdown("""
-<style>
-    .main-header { font-size: 2.4rem; font-weight: 700; color: #1e293b; margin-bottom: 4px; }
-    .sub-header { font-size: 1.1rem; color: #64748b; margin-bottom: 16px; }
-    .section-title { font-size: 1.5rem; font-weight: 600; color: #0f172a;
-                     border-bottom: 3px solid #1a56db; padding-bottom: 6px; margin: 24px 0 16px 0; }
-    .metric-card { background: #f1f5f9; border-radius: 12px; padding: 20px;
-                   border-left: 5px solid #1a56db; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
-    .highlight { background: #dbeafe; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
-    .stTabs [data-baseweb="tab-list"] { gap: 2px; }
-    .stTabs [data-baseweb="tab"] { height: auto; padding: 8px 18px; font-weight: 500; }
-    hr { margin: 20px 0; }
-    .footer { text-align: center; color: #94a3b8; font-size: .85rem; padding-top: 30px; }
-</style>
-""", unsafe_allow_html=True)
-
-RANDOM_STATE = 42
-np.random.seed(RANDOM_STATE)
-warnings.filterwarnings("ignore")
-
-UCI_FEATURES = [
-    "LIMIT_BAL", "SEX", "EDUCATION", "MARRIAGE", "AGE",
-    "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
-    "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
-    "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
+# ─────────────────────────────────────────────────────────────────
+# SYNTHETIC DATA
+# ─────────────────────────────────────────────────────────────────
+FEATURE_COLS = [
+    "loan_amount", "interest_rate", "term", "annual_income",
+    "debt_to_income", "credit_score", "employment_length",
+    "num_open_accounts", "num_derogatory_marks",
+    "revolving_utilization", "inquiries_last_6m",
+    "months_since_last_delinq",
 ]
-DEMOGRAPHIC_FEATURES = ["LIMIT_BAL", "SEX", "EDUCATION", "MARRIAGE", "AGE"]
-PAYMENT_HISTORY_FEATURES = ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
-BILL_FEATURES = ["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6"]
-PAYMENT_AMT_FEATURES = ["PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"]
 
-SEX_MAP = {1: "Male", 2: "Female"}
-EDU_MAP = {1: "Graduate", 2: "University", 3: "High School", 4: "Others", 5: "Unknown", 6: "Unknown"}
-MARRIAGE_MAP = {1: "Married", 2: "Single", 3: "Others"}
-PAY_STATUS_MAP = {-2: "No consumption", -1: "Paid in full", 0: "Revolving", 1: "1 month delay",
-                  2: "2 month delay", 3: "3 month delay", 4: "4 month delay", 5: "5+ month delay",
-                  6: "6+ month delay", 7: "7+ month delay", 8: "8+ month delay", 9: "9+ month delay"}
+@st.cache_data(show_spinner=False)
+def generate_loan_data(n: int = 30_000, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
 
-# ---------------------------------------------------------------------------
-# Dataset registry
-# ---------------------------------------------------------------------------
-DATASET_REGISTRY = {
-    "UCI Credit Card (Taiwan)": {
-        "loader": "load_uci_default", "source": "UCI ML Repository (ID 350)",
-        "country": "Taiwan", "year": 2005, "samples": 30000, "features": 23,
-        "target_col": "Class", "default_rate": 0.221,
-        "type": "Credit card default",
-        "fetch_code": "fetch_ucirepo(id=350)",
-        "url": "https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients",
-        "desc": (
-            "Default of Credit Card Clients dataset. Predicts whether a credit card holder "
-            "will default on their payment next month. Features include demographic info "
-            "(credit limit, gender, education, marital status, age) and 6-month payment history "
-            "(repayment status, bill amounts, payment amounts)."
-        ),
-    },
-    "German Credit (Germany)": {
-        "loader": "load_german_credit",
-        "source": "OpenML (ID 31) / UCI (ID 144)",
-        "country": "Germany", "year": 1994, "samples": 1000, "features": 20,
-        "target_col": "Class", "default_rate": 0.30,
-        "type": "Credit risk scoring (general, not card-specific)",
-        "fetch_code": "fetch_openml(data_id=31)",
-        "url": "https://www.openml.org/d/31",
-        "desc": (
-            "Statlog German Credit dataset. Classifies borrowers as good (low risk) or bad "
-            "(high risk) credit risks based on attributes like account status, credit history, "
-            "purpose, credit amount, employment status, and personal information."
-        ),
-    },
-    "Give Me Some Credit (USA)": {
-        "loader": "load_give_me_some_credit_",
-        "source": "empulse package (Kaggle Credit Fusion)",
-        "country": "USA", "year": 2011, "samples": 112915, "features": 10,
-        "target_col": "Class", "default_rate": 0.067,
-        "type": "Credit default (loan, not card-specific)",
-        "fetch_code": "load_give_me_some_credit()",
-        "url": "https://www.kaggle.com/c/GiveMeSomeCredit",
-        "desc": (
-            "Kaggle Give Me Some Credit dataset. Predicts whether a borrower will experience "
-            "serious delinquency within the next 2 years. Features include revolving utilization, "
-            "age, late payments (30-59, 60-89, 90+ days), debt ratio, monthly income, "
-            "open credit lines, real estate loans, and dependents."
-        ),
-    },
-    "PAKDD Credit Scoring (Brazil)": {
-        "loader": "load_pakdd_credit",
-        "source": "empulse package (PAKDD 2009)",
-        "country": "Brazil", "year": 2009, "samples": 38938, "features": 25,
-        "target_col": "Class", "default_rate": 0.20,
-        "type": "Credit card default (private label card)",
-        "fetch_code": "load_credit_scoring_pakdd()",
-        "url": "https://pakdd.org/archive/pakdd2009/",
-        "desc": (
-            "PAKDD 2009 Credit Scoring dataset. Predicts default on a private-label credit card "
-            "of a major Brazilian retailer. Features include demographic, financial, and "
-            "behavioral variables from 2003-2008."
-        ),
-    },
-    "Credit Approval (Confidential)": {
-        "loader": "load_credit_approval",
-        "source": "UCI ML Repository (ID 27)",
-        "country": "Confidential", "year": 1992, "samples": 690, "features": 15,
-        "target_col": "Class", "default_rate": 0.44,
-        "type": "Credit card application approval (not default)",
-        "fetch_code": "fetch_ucirepo(id=27)",
-        "url": "https://archive.ics.uci.edu/dataset/27/credit+approval",
-        "desc": (
-            "Credit Approval dataset. Classifies credit card applications as approved or rejected. "
-            "All attribute names anonymized (A1-A15). Mix of continuous, categorical, and "
-            "missing values. Note: this is about application approval, not default prediction."
-        ),
-    },
-    "Australian Credit (Australia)": {
-        "loader": "load_australian_credit",
-        "source": "UCI ML Repository (ID 143)",
-        "country": "Australia", "year": 1990, "samples": 690, "features": 14,
-        "target_col": "Class", "default_rate": 0.44,
-        "type": "Credit card application approval (not default)",
-        "fetch_code": "fetch_ucirepo(id=143)",
-        "url": "https://archive.ics.uci.edu/dataset/143/statlog+australian+credit+approval",
-        "desc": (
-            "Statlog Australian Credit Approval dataset. 6 numerical + 8 categorical attributes, "
-            "all anonymized. Part of the European StatLog project. "
-            "Note: this is about application approval, not default prediction."
-        ),
-    },
-}
-
-# ---------------------------------------------------------------------------
-# Dataset loaders  (all imports done at call time to avoid stale flags)
-# ---------------------------------------------------------------------------
-def load_uci_default():
-    from sklearn.datasets import fetch_openml
-    try:
-        data = fetch_openml(data_id=42477, as_frame=True, parser="auto")
-        df = data.frame
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        tc = [c for c in df.columns if "DEFAULT" in c.upper()]
-        if tc:
-            df = df.rename(columns={tc[0]: "Class"})
-        elif "CLASS" in df.columns:
-            df = df.rename(columns={"CLASS": "Class"})
-        elif "Y" in df.columns:
-            df = df.rename(columns={"Y": "Class"})
-        df["Class"] = df["Class"].astype(int)
-        return df
-    except Exception:
-        pass
-    try:
-        from ucimlrepo import fetch_ucirepo
-        data = fetch_ucirepo(id=350)
-        df = data.data.features.copy()
-        target = data.data.targets.copy()
-        df["Class"] = target.values.astype(int).ravel()
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        if "CLASS" in df.columns:
-            df = df.rename(columns={"CLASS": "Class"})
-        return df
-    except Exception:
-        pass
-    csv_paths = ["default_of_credit_card_clients.csv", "UCI_Credit_Card.csv",
-                 "data/default_of_credit_card_clients.csv"]
-    for p in csv_paths:
-        if Path(p).exists():
-            df = pd.read_csv(p)
-            df.columns = [str(c).strip().upper() for c in df.columns]
-            tc = [c for c in df.columns if "DEFAULT" in c]
-            if tc:
-                df = df.rename(columns={tc[0]: "Class"})
-            elif "Y" in df.columns:
-                df = df.rename(columns={"Y": "Class"})
-            df["Class"] = df["Class"].astype(int)
-            return df
-    return None
-
-def load_german_credit():
-    from sklearn.datasets import fetch_openml
-    X, y = fetch_openml(data_id=31, return_X_y=True, as_frame=True, parser="auto")
-    df = X.copy()
-    y_str = y.astype(str).str.strip()
-    mapping = {"1": 0, "2": 1, "good": 0, "bad": 1}
-    df["Class"] = y_str.map(mapping).astype(int)
-    return df
-
-def load_give_me_some_credit_():
-    from empulse.datasets import load_give_me_some_credit as _gmsc
-    dataset = _gmsc()
-    df = dataset.data.copy()
-    df["Class"] = dataset.target.astype(int)
-    return df
-
-def load_pakdd_credit():
-    from empulse.datasets import load_credit_scoring_pakdd as _pakdd
-    dataset = _pakdd()
-    df = dataset.data.copy()
-    df["Class"] = dataset.target.astype(int)
-    return df
-
-def load_credit_approval():
-    from ucimlrepo import fetch_ucirepo
-    data = fetch_ucirepo(id=27)
-    df = data.data.features.copy()
-    target = data.data.targets.copy()
-    tc = target.columns[0]
-    df["Class"] = target[tc].map({"+": 0, "-": 1}).astype(int)
-    return df
-
-def load_australian_credit():
-    from ucimlrepo import fetch_ucirepo
-    data = fetch_ucirepo(id=143)
-    df = data.data.features.copy()
-    target = data.data.targets.copy()
-    tc = target.columns[0]
-    df["Class"] = target[tc].map({1: 0, 2: 1}).astype(int)
-    return df
-
-LOADER_MAP = {
-    "load_uci_default": load_uci_default,
-    "load_german_credit": load_german_credit,
-    "load_give_me_some_credit_": load_give_me_some_credit_,
-    "load_pakdd_credit": load_pakdd_credit,
-    "load_credit_approval": load_credit_approval,
-    "load_australian_credit": load_australian_credit,
-}
-
-
-def load_data(dataset_name):
-    """Load dataset by name from the registry."""
-    if dataset_name not in DATASET_REGISTRY:
-        return None
-    loader_name = DATASET_REGISTRY[dataset_name]["loader"]
-    fn = LOADER_MAP.get(loader_name)
-    if fn is None:
-        return None
-    try:
-        df = fn()
-        if df is None:
-            return None
-        for c in df.columns:
-            if c != "Class":
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["Class"] = df["Class"].astype(int)
-        return df
-    except Exception as e:
-        st.warning(f"Failed to load {dataset_name}: {e}")
-        return None
-
-
-def make_synthetic_data():
-    """Generate synthetic credit data as final fallback."""
-    rng = np.random.default_rng(RANDOM_STATE)
-    n = 5000
-    df = pd.DataFrame()
-    df["LIMIT_BAL"] = rng.integers(10000, 1000000, n)
-    df["SEX"] = rng.integers(1, 3, n)
-    df["EDUCATION"] = rng.integers(1, 4, n)
-    df["MARRIAGE"] = rng.integers(1, 3, n)
-    df["AGE"] = rng.integers(21, 65, n)
-    for p in ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]:
-        df[p] = rng.integers(-2, 8, n)
-    for b in ["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6"]:
-        df[b] = rng.integers(0, 100000, n)
-    for p in ["PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"]:
-        df[p] = rng.integers(0, 50000, n)
-    score = (
-        0.3 * (df["LIMIT_BAL"] / 100000)
-        - 0.5 * (df["PAY_0"] > 2).astype(int)
-        - 0.4 * (df["PAY_2"] > 2).astype(int)
-        - 0.2 * (df["PAY_AMT1"] / 10000)
-        + 0.1 * (df["AGE"] / 10)
-        + rng.normal(0, 1, n)
+    loan_amount          = np.clip(np.exp(rng.normal(10.5, 1.0, n)), 5_000, 500_000)
+    interest_rate        = rng.uniform(5, 36, n)
+    term                 = rng.choice([36, 60], n, p=[0.6, 0.4])
+    annual_income        = np.clip(np.exp(rng.normal(11.0, 0.8, n)), 10_000, 1_000_000)
+    debt_to_income       = np.clip(rng.beta(2, 5, n), 0.01, 0.99)
+    credit_score         = np.clip(rng.normal(680, 80, n), 300, 850).astype(int)
+    employment_length    = np.clip(rng.exponential(5, n), 0, 20)
+    home_ownership       = rng.choice(["RENT","OWN","MORTGAGE"], n, p=[0.40, 0.15, 0.45])
+    purpose              = rng.choice(
+        ["car","debt_consolidation","home","medical","business","vacation"],
+        n, p=[0.10, 0.35, 0.15, 0.15, 0.15, 0.10],
     )
-    prob = 1 / (1 + np.exp(-score))
-    df["Class"] = (rng.random(n) < prob).astype(int)
-    return df
+    num_open_accounts        = np.clip(rng.poisson(10, n), 1, 40)
+    num_derogatory_marks     = rng.choice([0,1,2,3,4], n, p=[0.60,0.20,0.12,0.05,0.03])
+    revolving_utilization    = np.clip(rng.beta(2, 3, n), 0, 1)
+    inquiries_last_6m        = rng.choice([0,1,2,3,4,5], n, p=[0.40,0.25,0.18,0.10,0.04,0.03])
+    months_since_last_delinq = np.where(rng.random(n) < 0.4, rng.uniform(1, 120, n), 0.0)
 
-
-MODEL_SPECS = {
-    "Logistic Regression": {
-        "pipe": lambda: Pipeline([
-            ("features", CreditFeatures()),
-            ("clf", LogisticRegression(class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE)),
-        ]),
-    },
-    "Random Forest": {
-        "pipe": lambda: Pipeline([
-            ("features", CreditFeatures()),
-            ("clf", RandomForestClassifier(class_weight="balanced", n_estimators=100, n_jobs=-1, random_state=RANDOM_STATE)),
-        ]),
-    },
-    "LightGBM (Calibrated)": {
-        "pipe": lambda: Pipeline([
-            ("features", CreditFeatures()),
-            ("clf", lgb.LGBMClassifier(
-                class_weight="balanced", n_estimators=150, learning_rate=0.05,
-                num_leaves=31, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1
-            )),
-        ]),
-        "calibrate": True,
-    },
-}
-
-
-class CreditFeatures(BaseEstimator, TransformerMixin):
-    """Encode categorical features and scale numeric ones. Fit on training data only."""
-
-    def __init__(self):
-        self.encoders_ = {}
-        self.scaler_ = StandardScaler()
-
-    def fit(self, X, y=None):
-        self.cat_cols = [c for c in X.columns if X[c].dtype == "object" and c != "Class"]
-        for c in ["SEX", "EDUCATION", "MARRIAGE"]:
-            if c in X.columns and c not in self.cat_cols:
-                self.cat_cols.append(c)
-        self.num_cols = [c for c in X.columns if c not in self.cat_cols and c != "Class"]
-        for c in self.cat_cols:
-            if c in X.columns:
-                le = LabelEncoder()
-                le.fit(X[c].astype(str))
-                self.encoders_[c] = le
-        num_data = X[[c for c in self.num_cols if c in X.columns]].values.astype(float)
-        if num_data.shape[1] > 0:
-            self.scaler_.fit(num_data)
-        return self
-
-    def transform(self, X):
-        parts = []
-        num_cols = [c for c in self.num_cols if c in X.columns]
-        if num_cols:
-            num_scaled = self.scaler_.transform(X[num_cols].values.astype(float))
-            parts.append(pd.DataFrame(num_scaled, columns=num_cols, index=X.index))
-        for c in self.cat_cols:
-            if c in X.columns and c in self.encoders_:
-                encoded = self.encoders_[c].transform(X[c].astype(str))
-                parts.append(pd.DataFrame(encoded, columns=[c], index=X.index))
-        if not parts:
-            return X
-        return pd.concat(parts, axis=1)
-
-
-def train_and_evaluate(_df, selected_models=None, progress_bar=None, status_text=None):
-    """Run benchmark on selected models. Return results dict or None on abort."""
-    N_FOLDS = 3
-    if selected_models is None:
-        selected_models = list(MODEL_SPECS.keys())
-
-    X_all = _df.drop(columns=["Class"])
-    y_all = _df["Class"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_all, y_all, test_size=0.25, stratify=y_all, random_state=RANDOM_STATE
+    logit = (
+        -4.5
+        + (credit_score - 680) * (-0.012)
+        + debt_to_income * 3.0
+        + revolving_utilization * 2.5
+        + num_derogatory_marks * 0.8
+        + (interest_rate - 15) * 0.05
+        + inquiries_last_6m * 0.3
+        + rng.normal(0, 0.5, n)
     )
-
-    results = {"X_train": X_train, "X_test": X_test, "y_train": y_train, "y_test": y_test}
-    models = {}
-
-    active = [m for m in selected_models if m in MODEL_SPECS]
-    if "LightGBM (Calibrated)" in active and not HAS_LGB:
-        active.remove("LightGBM (Calibrated)")
-
-    total_steps = len(active) * (1 + N_FOLDS)
-    step = 0
-
-    def check_abort():
-        if st.session_state.get("abort", False):
-            st.session_state.abort = False
-            st.session_state.loading = False
-            st.warning("Training cancelled.")
-            return True
-        return False
-
-    for name in active:
-        if check_abort():
-            return None
-
-        spec = MODEL_SPECS[name]
-        if status_text:
-            status_text.text(f"Fitting {name}…")
-        if progress_bar:
-            progress_bar.progress(step / max(total_steps, 1))
-
-        pipe = spec["pipe"]()
-        if spec.get("calibrate"):
-            calib = CalibratedClassifierCV(estimator=pipe, method="isotonic", cv=3)
-            calib.fit(X_train, y_train)
-            proba = calib.predict_proba(X_test)[:, 1]
-            pipe_saved = calib
-        else:
-            pipe.fit(X_train, y_train)
-            proba = pipe.predict_proba(X_test)[:, 1]
-            pipe_saved = pipe
-
-        models[name] = {
-            "pipeline": pipe_saved, "proba": proba, "pred": None,
-            "pr_auc": average_precision_score(y_test, proba),
-            "roc_auc": roc_auc_score(y_test, proba),
-        }
-        step += 1
-
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    cv_results = {}
-
-    for name in active:
-        spec = MODEL_SPECS[name]
-        fold_scores = []
-        for fold_i, (tr, va) in enumerate(skf.split(X_train, y_train)):
-            if check_abort():
-                return None
-
-            if status_text:
-                status_text.text(f"Cross-val: {name} — fold {fold_i + 1}/{N_FOLDS}")
-            if progress_bar:
-                progress_bar.progress(step / max(total_steps, 1))
-
-            p = spec["pipe"]()
-            p.fit(X_train.iloc[tr], y_train.iloc[tr])
-            proba = p.predict_proba(X_train.iloc[va])[:, 1]
-            fold_scores.append(average_precision_score(y_train.iloc[va], proba))
-            step += 1
-
-        cv_results[name] = {
-            "mean": float(np.mean(fold_scores)),
-            "std": float(np.std(fold_scores)),
-            "folds": [float(s) for s in fold_scores],
-        }
-
-    results["models"] = models
-    results["cv_results"] = cv_results
-    fe_demo = CreditFeatures().fit(X_train)
-    demo_transformed = fe_demo.transform(X_train.head())
-    results["feature_names"] = list(demo_transformed.columns)
-    return results
-
-
-def fig_to_base64(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode()
-
-
-_tab_descriptions = {
-    "Overview": "Credit risk context, dataset summary, regulatory framework.",
-    "Data Explorer": "Target distribution, feature analysis, correlations.",
-    "Feature Engineering": "Encoding + scaling pipeline fitted on training data to prevent leakage.",
-    "Model Benchmarks": "3 classifiers compared via 3-fold CV, hold-out metrics, confusion matrices, McNemar test.",
-    "Scorecard": "Score distribution, approval rates by threshold, gain/lift, cost-sensitive threshold optimization.",
-    "Explainability": "SHAP feature attribution for individual predictions.",
-    "Model Card & About": "Documentation, intended use, limitations.",
-}
-
-
-# ── Sidebar ──────────────────────────────────────────────────────────────────────
-st.sidebar.markdown("## DefaultRisk")
-st.sidebar.caption("Probability of Default  \u00b7  Indian banking context")
-st.sidebar.markdown("---")
-
-ds_options = list(DATASET_REGISTRY.keys())
-default_idx = ds_options.index(st.session_state.dataset_name) if st.session_state.dataset_name in ds_options else 0
-selected_ds = st.sidebar.selectbox("Dataset", ds_options, index=default_idx, key="ds_selector")
-
-if selected_ds != st.session_state.dataset_name:
-    for k in ["df", "results", "y_test", "X_test", "models", "cv_results"]:
-        st.session_state[k] = None
-    st.session_state.data_loaded = False
-    st.session_state.dataset_error = None
-    st.session_state.dataset_name = selected_ds
-    st.session_state._load_attempted = False
-    st.rerun()
-
-meta = DATASET_REGISTRY.get(st.session_state.dataset_name)
-if meta:
-    ds_url = meta.get("url", "")
-    url_md = f"[Source]({ds_url})" if ds_url else ""
-    st.sidebar.info(
-        f"**{st.session_state.dataset_name}**  \n"
-        f"{meta['source']}  \n"
-        f"{meta['country']} \u00b7 {meta['samples']:,} rows \u00b7 "
-        f"{meta['features']} features  \n"
-        f"Default rate: {meta['default_rate']:.0%}  \n"
-        f"Type: {meta['type']}  \n"
-        f"{url_md}"
-    )
-
-st.sidebar.markdown("---")
-
-with st.sidebar.expander("Available Datasets"):
-    for name, m in DATASET_REGISTRY.items():
-        tick = "\u2705" if name == st.session_state.dataset_name else "\u2022"
-        u = m.get("url", "")
-        url_line = f"\n[Source link]({u})" if u else ""
-        st.markdown(f"**{tick} {name}**  ")
-        st.caption(
-            f"{m['country']} \u00b7 {m['samples']:,} rows \u00b7 {m['features']} features  \n"
-            f"{m['type']}  \n"
-            f"Fetch: `{m['fetch_code']}`{url_line}"
-        )
-        st.markdown("---")
-
-with st.sidebar.expander("Upload Custom Data"):
-    uploaded = st.file_uploader("CSV file", type=["csv"], key="custom_csv")
-    if uploaded is not None:
-        try:
-            df_upload = pd.read_csv(uploaded)
-            if "Class" not in df_upload.columns:
-                possible = [c for c in df_upload.columns if "default" in c.lower() or "target" in c.lower() or "class" in c.lower()]
-                if possible:
-                    df_upload = df_upload.rename(columns={possible[0]: "Class"})
-                else:
-                    st.error("CSV must contain a 'Class' column (or default/target/class).")
-                    df_upload = None
-            if df_upload is not None:
-                df_upload["Class"] = df_upload["Class"].astype(int)
-                st.session_state.df = df_upload
-                st.session_state.dataset_name = "Custom Upload"
-                st.session_state.data_loaded = False
-                st.rerun()
-        except Exception as e:
-            st.error(f"Error reading CSV: {e}")
-
-    url = st.text_input("URL (raw CSV)", placeholder="https://example.com/data.csv")
-    if st.button("Load from URL", key="load_url"):
-        if url:
-            try:
-                df_url = pd.read_csv(url)
-                if "Class" not in df_url.columns:
-                    possible = [c for c in df_url.columns if "default" in c.lower() or "target" in c.lower() or "class" in c.lower()]
-                    if possible:
-                        df_url = df_url.rename(columns={possible[0]: "Class"})
-                    else:
-                        st.error("CSV must contain a 'Class' column.")
-                        df_url = None
-                if df_url is not None:
-                    df_url["Class"] = df_url["Class"].astype(int)
-                    st.session_state.df = df_url
-                    st.session_state.dataset_name = "URL Import"
-                    st.session_state.data_loaded = False
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Error loading URL: {e}")
-
-with st.sidebar.expander("About Indian Bank Data"):
-    st.markdown(
-        "No Indian-specific credit default dataset is publicly available via API. "
-        "For real Indian data, download the **Indian Bank Credit Card** dataset from "
-        "[Kaggle](https://www.kaggle.com/datasets) and upload via **Upload Custom Data** above."
-    )
-
-tabs = [
-    "Overview",
-    "Data Explorer",
-    "Feature Engineering",
-    "Model Benchmarks",
-    "Scorecard",
-    "Explainability",
-    "Model Card & About",
-]
-active_tab = st.sidebar.radio("Go to", tabs, index=(
-    tabs.index(st.session_state.get("_last_tab", tabs[0]))
-    if st.session_state.get("_last_tab") in tabs else 0
-), key="tab_nav")
-st.session_state._last_tab = active_tab
-
-st.sidebar.markdown("---")
-
-
-def load_and_train():
-    """Load selected dataset and train selected models. Called on button click."""
-    st.session_state.abort = False
-    st.session_state.loading = True
-    st.rerun()
-
-
-def _do_load_and_train():
-    """Actual load + train, called after rerun so UI shows loading state."""
-    ds_name = st.session_state.dataset_name
-    status = st.empty()
-    progress = st.progress(0)
-
-    status.text(f"Loading {ds_name}...")
-    df = load_data(ds_name)
-    if df is None:
-        st.warning(f"Could not load {ds_name}. Using synthetic demo data.")
-        df = make_synthetic_data()
-        st.session_state.dataset_error = f"Could not load {ds_name}. Using synthetic demo data."
-    else:
-        st.session_state.dataset_error = None
-    st.session_state.df = df
-
-    sel = [m for m in MODEL_SPECS if st.session_state.get(f"sel_{m}", True)]
-    if not sel:
-        st.warning("Select at least one model before training.")
-        st.session_state.loading = False
-        st.rerun()
-        return
-    try:
-        results = train_and_evaluate(df, selected_models=sel, progress_bar=progress, status_text=status)
-        if results is None:
-            st.session_state.loading = False
-            st.session_state.data_loaded = False
-            st.rerun()
-            return
-        st.session_state.results = results
-        st.session_state.y_test = results["y_test"]
-        st.session_state.X_test = results["X_test"]
-        st.session_state.models = results["models"]
-        st.session_state.cv_results = results["cv_results"]
-        st.session_state.data_loaded = True
-    except Exception as e:
-        st.error(f"Model training failed: {e}")
-        st.session_state.results = None
-        st.session_state.y_test = None
-        st.session_state.X_test = None
-        st.session_state.models = None
-        st.session_state.cv_results = None
-    finally:
-        st.session_state.loading = False
-        status.empty()
-        progress.empty()
-    st.rerun()
-
-
-def tab_placeholder(tab_name):
-    st.markdown(f"### {tab_name}")
-    st.markdown(_tab_descriptions.get(tab_name, ""))
-    if st.session_state.get("loading", False):
-        st.info("Training in progress...")
-    else:
-        st.info("Go to **Overview** to load the dataset and train models.")
-
-
-# ── Execute training if triggered ──────────────────────────────────────
-if st.session_state.get("loading", False):
-    _do_load_and_train()
-
-if not st.session_state.data_loaded and not st.session_state.get("loading", False):
-    st.info("Select a dataset in the sidebar, then click **Train** below.")
-
-df = st.session_state.df
-results = st.session_state.results
-y_test = st.session_state.y_test
-X_test = st.session_state.X_test
-models = st.session_state.models
-cv_results = st.session_state.cv_results
-
-is_uci = bool(
-    st.session_state.dataset_name in DATASET_REGISTRY
-    and DATASET_REGISTRY[st.session_state.dataset_name]["loader"] == "load_uci_default"
-    and df is not None
-    and all(c in df.columns for c in ["LIMIT_BAL", "SEX", "EDUCATION"])
-)
-
-if active_tab == tabs[0]:
-    st.markdown("### Overview")
-    loading = st.session_state.get("loading", False)
-
-    col_left, col_right = st.columns([1, 1])
-    with col_left:
-        st.markdown("**Models**")
-        for m in ["Logistic Regression", "Random Forest", "LightGBM (Calibrated)"]:
-            st.checkbox(m, key=f"sel_{m}", value=True, disabled=loading)
-    with col_right:
-        st.markdown("**Threshold**")
-        st.slider(
-            "Default probability (reject if PD >= t)",
-            0.0, 1.0, key="decision_threshold", step=0.01,
-        )
-
-    if st.button("Load dataset & train", type="primary", use_container_width=True, disabled=loading):
-        load_and_train()
-
-    if loading:
-        st.stop()
-
-    if not st.session_state.data_loaded:
-        st.stop()
-    ds_name = st.session_state.dataset_name
-    ds_meta = DATASET_REGISTRY.get(ds_name)
-    defaults_count = int(df["Class"].sum())
-    total = len(df)
-    n_feats = len(df.columns) - 1
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Default rate", f"{df['Class'].mean():.1%}")
-    c2.metric("Accounts", f"{total:,}")
-    c3.metric("Features", n_feats)
-
-    st.markdown("---")
-    st.markdown("### Dataset")
-    st.write(f"**{ds_name}**")
-    if ds_meta:
-        st.write(ds_meta["desc"])
-        st.write(f"Source: {ds_meta['source']} ({ds_meta['country']})")
-        if ds_meta.get("url"):
-            st.write(f"Link: [{ds_meta['url']}]({ds_meta['url']})")
-
-
-elif active_tab == tabs[1]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[1])
-        st.stop()
-
-    ds_name = st.session_state.dataset_name
-    st.markdown("### Data Explorer")
-
-    if is_uci:
-        eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs([
-            "Default Distribution", "Demographics", "Payment History", "Correlations"
-        ])
-    else:
-        eda_tab1, eda_tab2 = st.tabs([
-            "Default Distribution", "Feature Analysis"
-        ])
-
-    with eda_tab1:
-        st.markdown("#### Target Distribution \u2014 Default vs Non-Default")
-        col_chart, col_metrics = st.columns([2, 1])
-        with col_chart:
-            fig, ax = plt.subplots(figsize=(8, 4.5))
-            counts = df["Class"].value_counts()
-            labels_map = {0: "Non-Default (0)", 1: "Default (1)"}
-            bars = ax.bar([labels_map.get(i, str(i)) for i in counts.index], counts.values,
-                          color=["#1a56db", "#ef4444"], width=0.5, edgecolor="white")
-            for bar, val in zip(bars, counts.values):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 200,
-                        f"{val:,} ({val/len(df):.1%})", ha="center", va="bottom",
-                        fontsize=11, fontweight="bold")
-            ax.set_ylabel("Count")
-            ax.set_title(f"Target Distribution ({ds_name})", fontweight="bold")
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            st.pyplot(fig)
-
-        with col_metrics:
-            st.markdown(
-                f'<div class="metric-card">'
-                f"<b>Key Stats</b><br><br>"
-                f"Non-Default: {counts.get(0, 0):,}<br>"
-                f"Default:  {counts.get(1, 0):,}<br>"
-                f"Default Rate: {df['Class'].mean():.1%}<br>"
-                f"Total: {len(df):,}<br>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"PR-AUC evaluates ranking performance on the default class "
-                f"(baseline accuracy: {max(df['Class'].mean(), 1-df['Class'].mean()):.0%})."
-            )
-
-    if is_uci:
-        with eda_tab2:
-            st.markdown("#### Demographic Analysis")
-            demo_choice = st.selectbox("Select demographic feature",
-                                       ["SEX", "EDUCATION", "MARRIAGE", "AGE", "LIMIT_BAL"])
-
-            if demo_choice == "SEX":
-                df_plot = df.copy()
-                df_plot["SEX"] = df_plot["SEX"].map(SEX_MAP).fillna("Unknown")
-                fig, ax = plt.subplots(figsize=(8, 4.5))
-                default_rates = df_plot.groupby("SEX")["Class"].mean()
-                counts_data = df_plot["SEX"].value_counts()
-                ax.bar(default_rates.index, default_rates.values,
-                       color=["#1a56db", "#ef4444"], edgecolor="white", width=0.4)
-                ax.set_ylabel("Default Rate")
-                ax.set_title("Default Rate by Gender", fontweight="bold")
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-                for i, (idx, val) in enumerate(default_rates.items()):
-                    ax.text(i, val + 0.005, f"{val:.1%}", ha="center", fontsize=10, fontweight="bold")
-                st.pyplot(fig)
-                st.caption("Sample: " + ", ".join([f"{k}: {v}" for k, v in counts_data.items()]))
-
-            elif demo_choice == "EDUCATION":
-                df_plot = df.copy()
-                df_plot["EDUCATION"] = df_plot["EDUCATION"].map(EDU_MAP).fillna("Unknown")
-                fig, ax = plt.subplots(figsize=(9, 4.5))
-                default_rates = df_plot.groupby("EDUCATION")["Class"].mean().sort_values()
-                ax.barh(default_rates.index, default_rates.values,
-                        color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in default_rates.values],
-                        edgecolor="white")
-                ax.axvline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
-                           label=f"Overall ({df['Class'].mean():.1%})")
-                ax.set_xlabel("Default Rate")
-                ax.set_title("Default Rate by Education Level", fontweight="bold")
-                ax.legend()
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-                st.pyplot(fig)
-
-            elif demo_choice == "MARRIAGE":
-                df_plot = df.copy()
-                df_plot["MARRIAGE"] = df_plot["MARRIAGE"].map(MARRIAGE_MAP).fillna("Unknown")
-                fig, ax = plt.subplots(figsize=(8, 4.5))
-                default_rates = df_plot.groupby("MARRIAGE")["Class"].mean()
-                ax.bar(default_rates.index, default_rates.values,
-                       color=["#1a56db", "#ef4444", "#64748b"], edgecolor="white", width=0.4)
-                ax.set_ylabel("Default Rate")
-                ax.set_title("Default Rate by Marital Status", fontweight="bold")
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-                for i, (idx, val) in enumerate(default_rates.items()):
-                    ax.text(i, val + 0.005, f"{val:.1%}", ha="center", fontsize=10, fontweight="bold")
-                st.pyplot(fig)
-
-            elif demo_choice == "AGE":
-                fig, ax = plt.subplots(figsize=(9, 4.5))
-                for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
-                    sns.kdeplot(df[df["Class"] == label]["AGE"], ax=ax,
-                                label=name, color=color, fill=True, alpha=0.35)
-                ax.set_xlabel("Age")
-                ax.set_ylabel("Density")
-                ax.set_title("Age Distribution by Default Status", fontweight="bold")
-                ax.legend()
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-                st.pyplot(fig)
-                st.caption("Younger borrowers (20\u201330) tend to have slightly higher default rates in this dataset.")
-
-            elif demo_choice == "LIMIT_BAL":
-                fig, ax = plt.subplots(figsize=(9, 4.5))
-                for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
-                    sns.kdeplot(df[df["Class"] == label]["LIMIT_BAL"] / 1000,
-                                ax=ax, label=name, color=color, fill=True, alpha=0.35)
-                ax.set_xlabel("Credit Limit (\u20b9 Thousands)")
-                ax.set_ylabel("Density")
-                ax.set_title("Credit Limit Distribution by Default Status", fontweight="bold")
-                ax.legend()
-                ax.spines["top"].set_visible(False)
-                ax.spines["right"].set_visible(False)
-                st.pyplot(fig)
-                st.caption("Lower credit limits are associated with higher default risk. "
-                           "In the Indian context, this correlates with CIBIL score bands.")
-
-        with eda_tab3:
-            st.markdown("#### Payment History Analysis")
-            st.markdown("Repayment status over 6 months (PAY_0 to PAY_6). "
-                        "Negative values indicate no balance or paid in full; positive values indicate delays.")
-            pay_col = st.selectbox("Select month", ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"],
-                                   format_func=lambda x: {"PAY_0": "Month 1 (latest)", "PAY_2": "Month 2",
-                                                           "PAY_3": "Month 3", "PAY_4": "Month 4",
-                                                           "PAY_5": "Month 5", "PAY_6": "Month 6"}[x])
-            fig, ax = plt.subplots(figsize=(10, 5))
-            grouped = df.groupby(pay_col)["Class"].mean()
-            counts_pay = df[pay_col].value_counts().sort_index()
-            ax.bar(grouped.index.astype(str), grouped.values,
-                   color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in grouped.values],
-                   edgecolor="white")
-            ax.axhline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
-                       label=f"Overall ({df['Class'].mean():.1%})")
-            ax.set_xlabel("Repayment Status (negative = paid, positive = delayed)")
-            ax.set_ylabel("Default Rate")
-            ax.set_title(f"Default Rate by {pay_col} Repayment Status", fontweight="bold")
-            ax.legend()
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            st.pyplot(fig)
-
-            st.markdown("#### Average Bill and Payment Amounts")
-            bill_means = df[BILL_FEATURES].mean()
-            pay_means = df[PAYMENT_AMT_FEATURES].mean()
-            fig, ax = plt.subplots(figsize=(10, 4.5))
-            x = range(len(BILL_FEATURES))
-            ax.plot(x, bill_means.values / 1000, marker="o", color="#1a56db", linewidth=2, label="Avg Bill Amount")
-            ax.plot(x, pay_means.values / 1000, marker="s", color="#22c55e", linewidth=2, label="Avg Payment Amount")
-            ax.set_xticks(x)
-            ax.set_xticklabels(["Month 1", "Month 2", "Month 3", "Month 4", "Month 5", "Month 6"])
-            ax.set_ylabel("Amount (\u20b9 Thousands)")
-            ax.set_title("Average Bill and Payment Amounts Over 6 Months", fontweight="bold")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
-
-        with eda_tab4:
-            st.markdown("#### Feature Correlation with Default")
-            st.markdown("Pearson correlation of all features with the default target.")
-
-            corr_data = df[UCI_FEATURES + ["Class"]].corr()["Class"].drop("Class").sort_values()
-
-            fig, ax = plt.subplots(figsize=(9, 10))
-            colors = ["#ef4444" if v < 0 else "#1a56db" for v in corr_data.values]
-            ax.barh(corr_data.index, corr_data.values, color=colors, edgecolor="white")
-            ax.axvline(0, color="black", linewidth=0.8)
-            ax.set_xlabel("Correlation with Default")
-            ax.set_title("Feature Correlation with Default Target", fontweight="bold")
-            st.pyplot(fig)
-
-            st.caption(
-                "PAY_0 (most recent repayment status) has the strongest positive correlation with default. "
-                "Higher credit limits (LIMIT_BAL) show negative correlation. "
-                "In Indian context, these align with CIBIL score components: payment history and credit utilization."
-            )
-    else:
-        with eda_tab2:
-            st.markdown("#### Feature Overview")
-            feat_cols = [c for c in df.columns if c != "Class"]
-            feat_type = st.selectbox("Select feature to visualise", feat_cols)
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            if df[feat_type].nunique() <= 10:
-                group_means = df.groupby(feat_type)["Class"].mean()
-                ax.bar(group_means.index.astype(str), group_means.values,
-                       color=["#ef4444" if v > df["Class"].mean() else "#1a56db" for v in group_means.values],
-                       edgecolor="white")
-                ax.axhline(df["Class"].mean(), color="black", linestyle="--", alpha=0.5,
-                           label=f"Overall ({df['Class'].mean():.1%})")
-                ax.set_xlabel(feat_type)
-                ax.set_ylabel("Default Rate")
-                ax.legend()
-            else:
-                for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
-                    sns.kdeplot(df[df["Class"] == label][feat_type], ax=ax,
-                                label=name, color=color, fill=True, alpha=0.35)
-                ax.set_xlabel(feat_type)
-                ax.set_ylabel("Density")
-            ax.set_title(f"Default Rate by {feat_type}", fontweight="bold")
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            st.pyplot(fig)
-
-            st.markdown("#### Feature Correlation with Default")
-            corr_data = df[[c for c in df.columns if c != "Class"] + ["Class"]].corr()["Class"].drop("Class").sort_values()
-            fig, ax = plt.subplots(figsize=(9, max(5, len(corr_data) * 0.35)))
-            colors = ["#ef4444" if v < 0 else "#1a56db" for v in corr_data.values]
-            ax.barh(corr_data.index, corr_data.values, color=colors, edgecolor="white")
-            ax.axvline(0, color="black", linewidth=0.8)
-            ax.set_xlabel("Correlation with Default")
-            ax.set_title("Feature Correlation with Default Target", fontweight="bold")
-            st.pyplot(fig)
-
-
-elif active_tab == tabs[2]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[2])
-        st.stop()
-    st.markdown("### Feature Engineering")
-
-    st.markdown(
-        "The UCI dataset contains a mix of categorical features (gender, education, marriage) and numeric features "
-        "(age, credit limit, payment amounts, bill amounts). A common error is applying encoders or scalers "
-        "on the full dataset before splitting, which leaks test-set information into training."
-        "\n\nFeature transformations are wrapped in a `BaseEstimator` + `TransformerMixin` class. "
-        "The `.fit()` method learns encoding mappings and scaling parameters **from training data only**, "
-        "and `.transform()` applies them to any input."
-    )
-
-    st.markdown("### Pipeline Architecture")
-    st.markdown(
-        "```\n"
-        "Pipeline([\n"
-        "    ('features', CreditFeatures()),  # Encode categoricals, scale numerics\n"
-        "    ('clf',      LightGBM(...)),       # Gradient boosting classifier\n"
-        "])\n"
-        "```"
-    )
-
-    st.markdown("### Feature Set")
-    feat_col1, feat_col2 = st.columns(2)
-    with feat_col1:
-        st.markdown("**Numeric Features (Standard Scaled)**")
-        st.markdown("Credit limit, age, bill amounts (6 months), payment amounts (6 months)")
-        st.markdown("**Total: 19 numeric**")
-    with feat_col2:
-        st.markdown("**Categorical Features (Label Encoded)**")
-        st.markdown("Gender (Male/Female), Education (Graduate/University/High School/Others), "
-                    "Marital Status (Married/Single/Others)")
-        st.markdown("**Total: 3 categorical**")
-
-    fe_demo = CreditFeatures().fit(df.drop(columns=["Class"]).head(5000))
-    before_cols = len(df.columns) - 1
-    after = fe_demo.transform(df.drop(columns=["Class"]).head(5))
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"**Before:** {before_cols} raw features")
-        st.dataframe(df.drop(columns=["Class"]).head(3), use_container_width=True)
-    with c2:
-        st.markdown(f"**After:** {len(after.columns)} features (same count, transformed)")
-        st.dataframe(after.head(3), use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("**Why this matters:** Inside `cross_val_score`, each fold re-fits the encoding step "
-                "on the training partition. Test-fold data does not influence encoding or scaling parameters.")
-
-
-elif active_tab == tabs[3]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[3])
-        st.stop()
-    if not cv_results or not models:
-        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
-        st.stop()
-    st.markdown("### Model Benchmarks")
-
-    st.markdown("### Cross-Validation (3-Fold Stratified)")
-    st.markdown("**Primary metric: PR-AUC** \u2014 measures ranking performance on the default class.")
-
-    if not cv_results:
-        st.warning("No cross-validation results available. Train at least one model to see CV scores.")
-    else:
-        cv_df = pd.DataFrame({
-            name: {"PR-AUC Mean": v["mean"], "PR-AUC Std": v["std"]}
-            for name, v in cv_results.items()
-        }).T
-
-        best_model = cv_df["PR-AUC Mean"].idxmax()
-        cv_df_styled = cv_df.style.apply(
-            lambda row: ["background: #dbeafe" if row.name == best_model else "" for _ in row],
-            axis=1
-        )
-        st.dataframe(cv_df_styled, use_container_width=True)
-
-        fig, ax = plt.subplots(figsize=(9, 5))
-        x_pos = np.arange(len(cv_results))
-        means = [v["mean"] for v in cv_results.values()]
-        stds = [v["std"] for v in cv_results.values()]
-        colors_bar = ["#22c55e" if n == best_model else "#1a56db" for n in cv_results.keys()]
-        bars = ax.bar(x_pos, means, yerr=stds, color=colors_bar, capsize=6, width=0.55,
-                      edgecolor="white", linewidth=1.2)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(list(cv_results.keys()), rotation=25, ha="right")
-        ax.set_ylabel("PR-AUC")
-        ax.set_title("3-Fold CV: PR-AUC (mean \u00b1 std)", fontweight="bold")
-        ax.set_ylim(0, 1.0)
-        ax.axhline(0.5, color="gray", linestyle="--", alpha=0.4, label="Random baseline")
-        ax.legend(fontsize=9)
-        for bar, mean in zip(bars, means):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.015,
-                    f"{mean:.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        st.pyplot(fig)
-
-        st.info(
-            f"**{best_model}** achieved the highest CV PR-AUC "
-            f"({cv_results[best_model]['mean']:.4f} \u00b1 {cv_results[best_model]['std']:.4f})."
-        )
-    st.markdown("---")
-
-    st.markdown("### Hold-Out Test Set")
-    rows = []
-    thr = st.session_state["decision_threshold"]
-    for name, m in models.items():
-        if m["proba"] is not None:
-            yt = y_test
-            pred = (m["proba"] >= thr).astype(int)
-            proba = m["proba"]
-            cm = confusion_matrix(yt, pred)
-            tn, fp, fn, tp = cm.ravel()
-            rows.append({
-                "Model": name,
-                "PR-AUC": f"{average_precision_score(yt, proba):.4f}",
-                "ROC-AUC": f"{roc_auc_score(yt, proba):.4f}",
-                "Precision": f"{precision_score(yt, pred):.4f}",
-                "Recall": f"{recall_score(yt, pred):.4f}",
-                "F1": f"{f1_score(yt, pred):.4f}",
-                "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-            })
-        else:
-            rows.append({"Model": name, "PR-AUC": f"{m['pr_auc']:.4f}",
-                         "ROC-AUC": "\u2014", "Precision": "\u2014", "Recall": "\u2014",
-                         "F1": "\u2014", "TP": "\u2014", "FP": "\u2014", "FN": "\u2014", "TN": "\u2014"})
-
-    test_df = pd.DataFrame(rows).set_index("Model")
-    st.dataframe(test_df, use_container_width=True)
-
-    st.markdown("### Confusion Matrices")
-    conf_cols = st.columns(3)
-    thr = st.session_state["decision_threshold"]
-    for idx, (name, m) in enumerate(models.items()):
-        if m["proba"] is not None:
-            cm = confusion_matrix(y_test, (m["proba"] >= thr).astype(int))
-            tn, fp, fn, tp = cm.ravel()
-            with conf_cols[idx % 3]:
-                fig, ax = plt.subplots(figsize=(3.5, 3.5))
-                ax.imshow(cm, cmap="Blues", interpolation="nearest")
-                for i in range(2):
-                    for j in range(2):
-                        ax.text(j, i, str(cm[i, j]), ha="center", va="center",
-                                fontsize=13, fontweight="bold",
-                                color="white" if cm[i, j] > cm.max() / 2 else "black")
-                ax.set_xticks([0, 1])
-                ax.set_yticks([0, 1])
-                ax.set_xticklabels(["Pred Non-Default", "Pred Default"])
-                ax.set_yticklabels(["True Non-Default", "True Default"])
-                ax.set_title(f"{name}", fontweight="bold")
-                st.pyplot(fig)
-
-    st.markdown("---")
-    st.markdown("### McNemar\u2019s Test for Statistical Significance")
-    st.markdown(
-        "McNemar\u2019s test evaluates whether two classifiers have significantly different error distributions "
-        "using discordant pairs where one model is correct and the other is wrong."
-    )
-
-    lr_name = "Logistic Regression"
-    thr = st.session_state["decision_threshold"]
-    valid_models = [n for n in models.keys() if models[n].get("proba") is not None]
-    best_model_name = max(valid_models, key=lambda n: models[n]["pr_auc"]) if valid_models else (lr_name if lr_name in models else list(models.keys())[0])
-
-    if lr_name in models and models[lr_name]["proba"] is not None:
-        lr_pred = (models[lr_name]["proba"] >= thr).astype(int)
-        best_pred = (models[best_model_name]["proba"] >= thr).astype(int)
-
-        both_correct = ((lr_pred == y_test) & (best_pred == y_test)).sum()
-        lr_only = ((lr_pred == y_test) & (best_pred != y_test)).sum()
-        best_only = ((lr_pred != y_test) & (best_pred == y_test)).sum()
-        both_wrong = ((lr_pred != y_test) & (best_pred != y_test)).sum()
-
-        b, c = lr_only, best_only
-        stat = (abs(b - c) - 1) ** 2 / (b + c) if (b + c) > 0 else 0
-        pval = 1 - chi2.cdf(stat, df=1)
-
-        mcnemar_df = pd.DataFrame(
-            [[both_correct, best_only], [lr_only, both_wrong]],
-            index=[f"{best_model_name} correct", f"{best_model_name} wrong"],
-            columns=["LR correct", "LR wrong"],
-        )
-        st.dataframe(mcnemar_df, use_container_width=True)
-        st.markdown(f"**McNemar statistic:** {stat:.2f}  |  **p-value:** {pval:.2e}")
-        if pval < 0.05:
-            winner = best_model_name if best_only > lr_only else lr_name
-            st.success(
-                f"Reject H\u2080 at \u03b1=0.05. **{winner}** is statistically significantly better "
-                f"({best_only} vs {lr_only} discordant pairs)."
-            )
-        else:
-            st.info("Fail to reject H\u2080 \u2014 classifiers are statistically indistinguishable.")
-
-
-elif active_tab == tabs[4]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[4])
-        st.stop()
-    if not models:
-        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
-        st.stop()
-    st.markdown("### Scorecard")
-
-    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
-    best_proba = models[best_name]["proba"]
-
-    if best_proba is not None:
-        st.info(f"Using **{best_name}** (best PR-AUC).")
-
-        st.markdown("### Score Distribution by Default Status")
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        for label, color, name in [(0, "#1a56db", "Non-Default"), (1, "#ef4444", "Default")]:
-            sns.kdeplot(best_proba[y_test.values == label], ax=ax,
-                        label=name, color=color, fill=True, alpha=0.35)
-        ax.set_xlabel("Predicted Default Probability")
-        ax.set_ylabel("Density")
-        ax.set_title("Score Distribution by Actual Default Status", fontweight="bold")
-        ax.legend()
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        st.pyplot(fig)
-
-        st.markdown("### Approval Rate vs Default Rate by Threshold")
-        thresholds = np.linspace(0.01, 0.99, 100)
-        approval_rates = []
-        default_rates_at_thresh = []
-        fns = []
-        fps = []
-        for t in thresholds:
-            pred = (best_proba >= t).astype(int)
-            approval_rates.append((pred == 0).mean())
-            approved = pred == 0
-            default_rates_at_thresh.append(y_test.values[approved].mean() if approved.sum() > 0 else 0)
-            cm = confusion_matrix(y_test.values, pred)
-            tn, fp, fn, tp = cm.ravel()
-            fns.append(fn)
-            fps.append(fp)
-
-        fig, ax1 = plt.subplots(figsize=(10, 4.5))
-        ax1.plot(thresholds, approval_rates, color="#1a56db", linewidth=2, label="Approval Rate")
-        ax1.set_xlabel("Decision Threshold")
-        ax1.set_ylabel("Approval Rate", color="#1a56db")
-        ax1.tick_params(axis="y", labelcolor="#1a56db")
-        ax2 = ax1.twinx()
-        ax2.plot(thresholds, default_rates_at_thresh, color="#ef4444", linewidth=2, label="Default Rate")
-        ax2.set_ylabel("Default Rate Among Approved", color="#ef4444")
-        ax2.tick_params(axis="y", labelcolor="#ef4444")
-        ax1.set_title("Approval Rate and Default Rate by Threshold", fontweight="bold")
-        ax1.grid(True, alpha=0.3)
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right")
-        st.pyplot(fig)
-
-        st.markdown("### Gain / Lift Chart")
-        order = np.argsort(-best_proba)
-        y_sorted = y_test.values[order]
-        cumulative_defaults = np.cumsum(y_sorted)
-        total_defaults = y_sorted.sum()
-        pct_population = np.arange(1, len(y_sorted) + 1) / len(y_sorted)
-        pct_defaults = cumulative_defaults / total_defaults
-
-        fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(pct_population, pct_defaults, color="#1a56db", linewidth=2, label="Model")
-        ax.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=1.5, label="Random")
-        ax.fill_between(pct_population, pct_defaults, pct_population, alpha=0.15, color="#1a56db")
-        ax.set_xlabel("Population (%)")
-        ax.set_ylabel("Defaults Captured (%)")
-        ax.set_title("Gain Chart \u2014 Cumulative Defaults Captured", fontweight="bold")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        st.pyplot(fig)
-
-        st.caption(
-            "The gain chart shows the proportion of all defaults captured when reviewing the top-N% of accounts "
-            "ranked by predicted default probability. A steeper curve indicates better ranking performance."
-        )
-
-        st.markdown("### Misclassification Costs")
-        st.markdown(
-            "Adjust the cost assumptions to reflect Indian lending economics. "
-            "FN cost represents principal loss from a default. FP cost represents interest margin lost from declining a good customer."
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            C_FN = st.number_input("FN Cost (\u20b9, default loss)", min_value=1, value=100000, step=10000,
-                                    help="Principal loss from a defaulted account")
-        with c2:
-            C_FP = st.number_input("FP Cost (\u20b9, missed margin)", min_value=1, value=15000, step=1000,
-                                    help="Interest margin lost from declining a good customer")
-
-        costs = [fn * C_FN + fp * C_FP for fn, fp in zip(fns, fps)]
-        opt_idx = int(np.argmin(costs))
-
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        ax.plot(thresholds, costs, color="#ef4444", linewidth=2)
-        ax.axvline(thresholds[opt_idx], color="#22c55e", linestyle="--", linewidth=2,
-                   label=f"Optimal t = {thresholds[opt_idx]:.3f}")
-        ax.set_xlabel("Decision Threshold")
-        ax.set_ylabel("Total Cost (\u20b9)")
-        ax.set_title("Cost Curve \u2014 Minimising Expected Loss", fontweight="bold")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        st.pyplot(fig)
-
-        r1, r2, r3, r4 = st.columns(4)
-        with r1:
-            st.metric("Optimal Threshold", f"{thresholds[opt_idx]:.3f}")
-        with r2:
-            st.metric("Minimum Cost", f"\u20b9{costs[opt_idx]:,.0f}")
-        with r3:
-            pred_opt = (best_proba >= thresholds[opt_idx]).astype(int)
-            cm = confusion_matrix(y_test, pred_opt)
-            tn, fp, fn, tp = cm.ravel()
-            st.metric("Recall at Optimum", f"{tp / (tp + fn):.1%}",
-                      help=f"Caught {tp} / {tp + fn} defaults")
-        with r4:
-            st.metric("Precision at Optimum", f"{tp / (tp + fp):.1%}",
-                      help=f"{tp} real defaults out of {tp + fp} flagged")
-
-
-elif active_tab == tabs[5]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[5])
-        st.stop()
-    if not models:
-        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
-        st.stop()
-    st.markdown("### Explainability")
-
-    if not HAS_SHAP:
-        st.warning(
-            "SHAP not installed. Run `pip install shap` to enable this tab. "
-            "For Streamlit Cloud deployments, add `shap>=0.44` to requirements.txt"
-        )
-        st.markdown("SHAP uses cooperative game theory to attribute feature contributions to individual predictions.")
-    else:
-        best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
-
-        X_all = df.drop(columns=["Class"])
-        y_all = df["Class"]
-        X_tr, X_te, y_tr, y_te = train_test_split(X_all, y_all, test_size=0.25, stratify=y_all, random_state=RANDOM_STATE)
-
-        with st.spinner("Training SHAP-compatible model and computing Shapley values..."):
-            if HAS_LGB:
-                shap_pipe = Pipeline([
-                    ("features", CreditFeatures()),
-                    ("clf", lgb.LGBMClassifier(
-                        class_weight="balanced", n_estimators=300, learning_rate=0.05,
-                        num_leaves=31, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1
-                    )),
-                ])
-            else:
-                shap_pipe = Pipeline([
-                    ("features", CreditFeatures()),
-                    ("clf", RandomForestClassifier(
-                        class_weight="balanced", n_estimators=200, n_jobs=-1, random_state=RANDOM_STATE
-                    )),
-                ])
-            shap_pipe.fit(X_tr, y_tr)
-
-            eng = shap_pipe.named_steps["features"]
-            model = shap_pipe.named_steps["clf"]
-            X_sample = X_te.sample(min(500, len(X_te)), random_state=RANDOM_STATE)
-            X_eng = eng.transform(X_sample)
-
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_eng)
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]
-
-        st.markdown("#### SHAP Summary Plot \u2014 Global Feature Importance")
-        st.markdown("Features ranked by mean absolute SHAP value. "
-                    "Color indicates feature value (red = high, blue = low).")
-
-        fig, ax = plt.subplots(figsize=(10, 7))
-        shap.summary_plot(shap_values, X_eng, feature_names=X_eng.columns.tolist(),
-                          show=False, max_display=15, alpha=0.7, color_bar=True)
-        plt.title("SHAP Feature Impact on Default Probability", fontsize=12, fontweight="bold")
-        st.pyplot(fig)
-
-        st.markdown("---")
-        st.markdown("#### Single Prediction \u2014 Feature Contributions")
-        st.markdown("Top contributing features for a high-confidence default prediction from the hold-out set.")
-
-        proba_sample = shap_pipe.predict_proba(X_sample)[:, 1]
-        default_idx = np.where(y_te.loc[X_sample.index].values == 1)[0]
-        if len(default_idx):
-            best_default = default_idx[np.argmax(proba_sample[default_idx])]
-            contribs = pd.Series(shap_values[best_default], index=X_eng.columns).sort_values(key=abs, ascending=False)
-
-            fig, ax = plt.subplots(figsize=(9, 5))
-            top = contribs.head(10)
-            colors_waterfall = ["#ef4444" if v > 0 else "#1a56db" for v in top.values]
-            ax.barh(top.index[::-1], top.values[::-1], color=colors_waterfall[::-1], edgecolor="white")
-            ax.axvline(0, color="black", linewidth=0.6)
-            ax.set_xlabel("SHAP Value (impact on default probability log-odds)")
-            ax.set_title(f"Top Contributors \u2014 Model Score = {proba_sample[best_default]:.3f}",
-                         fontweight="bold")
-            st.pyplot(fig)
-
-            st.caption(
-                "Positive SHAP values push the prediction toward DEFAULT. "
-                "Negative SHAP values push the prediction toward NON-DEFAULT."
-            )
-
-        st.markdown("---")
-        with st.expander("SHAP Formula \u2014 Shapley Values from Cooperative Game Theory"):
-            st.latex(
-                r"\phi_i = \sum_{S \subseteq N \setminus \{i\}} "
-                r"\frac{|S|!\,(n - |S| - 1)!}{n!} \big( v(S \cup \{i\}) - v(S) \big)"
-            )
-            st.markdown(
-                "Where $\\phi_i$ is the Shapley value for feature $i$, $S$ is a subset of features, "
-                "and $v(S)$ is the model\u2019s prediction using only features in $S$."
-            )
-
-
-elif active_tab == tabs[6]:
-    if not st.session_state.data_loaded:
-        tab_placeholder(tabs[6])
-        st.stop()
-    if not models or not cv_results:
-        st.error("Model results unavailable. Did you select at least one model in the sidebar? Try loading the dataset again.")
-        st.stop()
-    st.markdown("### Model Card")
-
-    best_name = max(models, key=lambda n: (models[n]["pr_auc"] if models[n].get("proba") is not None else 0)) if models else ""
-    best_pr = models[best_name]["pr_auc"]
-    cv_best = max((v["mean"] for v in cv_results.values()), default=0)
-    ds_name = st.session_state.dataset_name
-    ds_meta = DATASET_REGISTRY.get(ds_name)
-    src_name = ds_meta["source"] if ds_meta else ds_name
-    n_feats_mc = len(df.columns) - 1
-
-    model_card = {
-        "Model Name": "DefaultRisk-v1",
-        "Task": "Binary classification (default vs non-default)",
-        "Regulatory Context": "RBI Basel III \u2014 IRB approach for PD estimation",
-        "Training Data": {
-            "Source": src_name,
-            "Rows": f"{len(df):,}",
-            "Default Rate": f"{df['Class'].mean():.1%}",
-            "Features": f"{n_feats_mc}",
-        },
-        "Model Architecture": best_name,
-        "Primary Metric": "PR-AUC (Average Precision)",
-        "Cross-Validation": f"{cv_best:.4f} (5-fold stratified mean)",
-        "Hold-Out PR-AUC": f"{best_pr:.4f}",
-        "Calibration": "Isotonic regression",
-        "Explainability": "SHAP TreeExplainer",
-    }
-
-    st.json(model_card, expanded=False)
-
-    st.markdown("---")
-    st.markdown("### Intended Use & Limitations")
-
-    c_use, c_lim = st.columns(2)
-    with c_use:
-        st.markdown("**Intended Use**")
-        st.markdown("""
-        - Credit card application scoring for Indian banks and NBFCs
-        - PD estimation for RBI Basel III capital calculations
-        - Portfolio risk monitoring and early warning systems
-        - Credit limit management and collection prioritization
-        """)
-
-    with c_lim:
-        st.markdown("**Limitations**")
-        ds_meta_lim = DATASET_REGISTRY.get(st.session_state.dataset_name)
-        lim_note = f"Dataset from {ds_meta_lim['country']} ({ds_meta_lim['year']})" if ds_meta_lim else "Dataset source"
-        st.markdown(f"""
-        - {lim_note} \u2014 Indian demographic mapping is illustrative, not exact
-        - No CIBIL/credit bureau scores directly available in this dataset
-        - No reject inference \u2014 only approved accounts in training data
-        - Feature set may not capture long-term credit behavior
-        """)
-
-    st.markdown("---")
-    st.markdown("### Monitoring Plan")
-    mon_df = pd.DataFrame({
-        "Layer": ["Input Drift", "Performance Drift", "Outcome Drift"],
-        "Metric": [
-            "PSI on score distribution; feature stability index",
-            "Monthly PR-AUC back-test; KS statistic",
-            "Actual vs predicted default rate by quarter",
-        ],
-        "Trigger": [
-            "PSI > 0.25 on any top-5 feature",
-            "PR-AUC drop > 10% from baseline",
-            "Default rate deviation > 2\u00d7 std from expected",
-        ],
-        "Action": ["Retrain model", "Investigate and retrain", "Review with Credit Risk team"],
+    pd_prob = 1.0 / (1.0 + np.exp(-np.clip(logit, -35, 35)))
+    default = (rng.random(n) < pd_prob).astype(int)
+
+    return pd.DataFrame({
+        "loan_amount":              loan_amount,
+        "interest_rate":            interest_rate,
+        "term":                     term,
+        "annual_income":            annual_income,
+        "debt_to_income":           debt_to_income,
+        "credit_score":             credit_score,
+        "employment_length":        employment_length,
+        "home_ownership":           home_ownership,
+        "purpose":                  purpose,
+        "num_open_accounts":        num_open_accounts,
+        "num_derogatory_marks":     num_derogatory_marks,
+        "revolving_utilization":    revolving_utilization,
+        "inquiries_last_6m":        inquiries_last_6m,
+        "months_since_last_delinq": months_since_last_delinq,
+        "default":                  default,
     })
-    st.dataframe(mon_df, use_container_width=True, hide_index=True)
 
-    st.markdown("---")
-    st.markdown("### Tech Stack")
-    stack_cols = st.columns(4)
-    tech_stack = [
-        ("Python 3.11+", "Core language"),
-        ("scikit-learn", "Pipeline, models, metrics"),
-        ("LightGBM", "Gradient boosting (champion model)"),
-        ("SHAP", "Explainability (TreeExplainer)"),
-        ("Matplotlib/Seaborn", "Static visualisations"),
-        ("Plotly", "Interactive charts"),
-        ("Streamlit", "Dashboard framework"),
-        ("UCI / OpenML", "Data source"),
+# ─────────────────────────────────────────────────────────────────
+# ML PRIMITIVES  (pure NumPy)
+# ─────────────────────────────────────────────────────────────────
+def sigmoid(z: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -35, 35)))
+
+def standardize(X_tr, X_te=None):
+    mu = X_tr.mean(0);  sd = X_tr.std(0) + 1e-8
+    if X_te is None:
+        return (X_tr - mu) / sd, mu, sd
+    return (X_tr - mu) / sd, (X_te - mu) / sd, mu, sd
+
+def logistic_sgd(X, y, lr=0.12, epochs=350, l2=1e-3, seed=0):
+    rng = np.random.default_rng(seed)
+    n, d = X.shape
+    w, b = rng.normal(0, 0.01, d), 0.0
+    pos  = max(y.sum(), 1);   neg = max((1 - y).sum(), 1)
+    sw   = np.where(y == 1, n / (2 * pos), n / (2 * neg))
+    for _ in range(epochs):
+        p   = sigmoid(X @ w + b);   err = (p - y) * sw
+        w  -= lr * (X.T @ err / n + l2 * w)
+        b  -= lr * err.mean()
+    return w, b
+
+def roc_auc_wilcoxon(y, s):
+    y, s = np.asarray(y), np.asarray(s, float)
+    npos = (y == 1).sum();  nneg = (y == 0).sum()
+    if npos == 0 or nneg == 0:
+        return float("nan")
+    order = np.argsort(s)
+    ranks = np.empty(len(s));  ranks[order] = np.arange(1, len(s) + 1)
+    return float((ranks[y == 1].sum() - npos * (npos + 1) / 2) / (npos * nneg))
+
+def manual_roc(y, scores, n_t=200):
+    thresholds = np.linspace(0, 1, n_t)
+    pos = y.sum();  neg = len(y) - pos
+    tprs, fprs = [], []
+    for t in thresholds:
+        pred = (scores >= t).astype(int)
+        tp = ((pred == 1) & (y == 1)).sum()
+        fp = ((pred == 1) & (y == 0)).sum()
+        tprs.append(tp / max(pos, 1))
+        fprs.append(fp / max(neg, 1))
+    fpr = np.array(fprs[::-1]);  tpr = np.array(tprs[::-1])
+    return fpr, tpr, float(np.trapz(tpr, fpr))
+
+def manual_pr(y, scores, n_t=200):
+    thresholds = np.linspace(0, 1, n_t)
+    pos = y.sum()
+    precs, recs = [], []
+    for t in thresholds:
+        pred = (scores >= t).astype(int)
+        tp = ((pred == 1) & (y == 1)).sum()
+        fp = ((pred == 1) & (y == 0)).sum()
+        precs.append(tp / max(tp + fp, 1))
+        recs.append(tp / max(pos, 1))
+    rec  = np.array(recs[::-1]);  prec = np.array(precs[::-1])
+    return rec, prec, float(np.trapz(prec, rec))
+
+def ks_stat(y, scores):
+    order    = np.argsort(scores)
+    ys       = y[order]
+    cum_pos  = np.cumsum(ys)      / max(y.sum(), 1)
+    cum_neg  = np.cumsum(1 - ys) / max((1 - y).sum(), 1)
+    return float(np.max(np.abs(cum_pos - cum_neg)))
+
+def log_loss_fn(y, p):
+    p = np.clip(p, 1e-9, 1 - 1e-9)
+    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+def brier_fn(y, p):
+    return float(np.mean((y - p) ** 2))
+
+# ─────────────────────────────────────────────────────────────────
+# FEATURE MATRIX
+# ─────────────────────────────────────────────────────────────────
+def build_X(df: pd.DataFrame):
+    X = df[FEATURE_COLS].copy().astype(float)
+    X["home_own"]          = (df["home_ownership"] == "OWN").astype(float)
+    X["home_mortgage"]     = (df["home_ownership"] == "MORTGAGE").astype(float)
+    X["purpose_dti"]       = (df["purpose"] == "debt_consolidation").astype(float)
+    X["purpose_business"]  = (df["purpose"] == "business").astype(float)
+    return X.values, list(X.columns)
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL TRAINING  (cached resource)
+# ─────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def train_model(_df: pd.DataFrame) -> dict:
+    X, feat_names = build_X(_df)
+    y = _df["default"].values.astype(float)
+
+    rng  = np.random.default_rng(7)
+    idx  = rng.permutation(len(X))
+    n_te = int(len(X) * 0.2)
+    X_tr, X_te = X[idx[n_te:]], X[idx[:n_te]]
+    y_tr, y_te = y[idx[n_te:]], y[idx[:n_te]]
+
+    X_tr_s, X_te_s, mu, sd = standardize(X_tr, X_te)
+    w, b = logistic_sgd(X_tr_s, y_tr, lr=0.12, epochs=350)
+
+    sc_tr = sigmoid(X_tr_s @ w + b)
+    sc_te = sigmoid(X_te_s @ w + b)
+
+    fpr, tpr, auc  = manual_roc(y_te, sc_te)
+    rec, prec, prauc = manual_pr(y_te, sc_te)
+
+    return dict(
+        w=w, b=b, mu=mu, sd=sd, feat_names=feat_names,
+        X_tr=X_tr, X_te=X_te, y_tr=y_tr, y_te=y_te,
+        sc_tr=sc_tr, sc_te=sc_te,
+        fpr=fpr, tpr=tpr, auc=auc,
+        rec=rec, prec=prec, prauc=prauc,
+        ks=ks_stat(y_te, sc_te),
+        gini=2 * auc - 1,
+        ll=log_loss_fn(y_te, sc_te),
+        brier=brier_fn(y_te, sc_te),
+    )
+
+def predict_pd(df_input: pd.DataFrame, mdl: dict) -> np.ndarray:
+    X, _ = build_X(df_input)
+    Xs   = (X - mdl["mu"]) / mdl["sd"]
+    return sigmoid(Xs @ mdl["w"] + mdl["b"])
+
+# ─────────────────────────────────────────────────────────────────
+# LOAD DATA & MODEL
+# ─────────────────────────────────────────────────────────────────
+with st.spinner("Generating 30,000 synthetic loans..."):
+    df = generate_loan_data(30_000)
+
+with st.spinner("Training credit model (NumPy SGD)..."):
+    mdl = train_model(df)
+
+# ─────────────────────────────────────────────────────────────────
+# HEADER METRICS
+# ─────────────────────────────────────────────────────────────────
+loan_pd_all  = predict_pd(df, mdl)
+if pd_override:
+    loan_pd_all = np.full(len(df), pd_manual)
+
+loan_ead_all = df["loan_amount"].values * ead_mult
+el_all       = loan_pd_all * lgd * loan_ead_all
+total_el     = el_all.sum()
+dr_mean      = df["default"].mean()
+cs_mean      = df["credit_score"].mean()
+dti_mean     = df["debt_to_income"].mean()
+
+revenue  = (df["loan_amount"] * df["interest_rate"] / 100 * (df["term"] / 12)).sum() * 0.8
+op_cost  = revenue * 0.25
+ec_rough = total_el * 3
+raroc    = (revenue - total_el - op_cost) / max(ec_rough, 1)
+
+st.title("DefaultRisk — Credit Default Prediction Platform")
+st.caption("LendingClub / Basel III Framing  |  Pure NumPy Logistic Regression  |  30,000 Synthetic Loans")
+
+h = st.columns(6)
+h[0].metric("Total Loans",     f"{len(df):,}")
+h[1].metric("Portfolio EL ($)", f"${total_el:,.0f}")
+h[2].metric("Default Rate",     f"{dr_mean:.1%}")
+h[3].metric("Mean Credit Score",f"{cs_mean:.0f}")
+h[4].metric("Mean DTI",         f"{dti_mean:.2f}")
+h[5].metric("RAROC",            f"{raroc:.2%}")
+st.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Loan Portfolio Explorer",
+    "🔬 Credit Risk Factors",
+    "🤖 Model Training & Scorecard",
+    "📋 Scorecard & Scorepoints",
+    "💰 Portfolio Risk & Capital",
+])
+
+# ───────────────────────────────────────────────
+# TAB 1 — LOAN PORTFOLIO EXPLORER
+# ───────────────────────────────────────────────
+with tab1:
+    st.header("📊 Loan Portfolio Explorer")
+
+    def cs_band(cs):
+        if   cs < 580: return "300-579 Bad"
+        elif cs < 670: return "580-669 Fair"
+        elif cs < 740: return "670-739 Good"
+        elif cs < 800: return "740-799 Very Good"
+        else:          return "800+ Exceptional"
+
+    df["cs_band"] = df["credit_score"].apply(cs_band)
+    BAND_ORDER    = ["300-579 Bad","580-669 Fair","670-739 Good","740-799 Very Good","800+ Exceptional"]
+
+    st.subheader("Summary Statistics")
+    show_cols = ["loan_amount","interest_rate","annual_income",
+                 "debt_to_income","credit_score","revolving_utilization","default"]
+    st.dataframe(df[show_cols].describe().round(3), use_container_width=True)
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+
+    # 1 — loan amount
+    ax = axes[0, 0]
+    ax.hist(df["loan_amount"] / 1_000, bins=60, color="steelblue", edgecolor="white", alpha=0.85)
+    ax.set_title("Loan Amount Distribution", fontweight="bold")
+    ax.set_xlabel("Loan Amount ($K)");  ax.set_ylabel("Count");  ax.grid(axis="y", alpha=0.3)
+
+    # 2 — interest rate by default
+    ax = axes[0, 1]
+    ax.hist(df.loc[df["default"]==0,"interest_rate"], bins=40, alpha=0.6,
+            color="steelblue", density=True, label="Non-Default")
+    ax.hist(df.loc[df["default"]==1,"interest_rate"], bins=40, alpha=0.6,
+            color="crimson",   density=True, label="Default")
+    ax.set_title("Interest Rate by Default Status", fontweight="bold")
+    ax.set_xlabel("Interest Rate (%)");  ax.set_ylabel("Density")
+    ax.legend();  ax.grid(axis="y", alpha=0.3)
+
+    # 3 — default rate by cs band
+    ax = axes[0, 2]
+    band_dr = df.groupby("cs_band")["default"].mean().reindex(BAND_ORDER)
+    colors  = ["#d62728","#ff7f0e","#bcbd22","#2ca02c","#1f77b4"]
+    bars    = ax.bar(range(len(BAND_ORDER)), band_dr.values * 100, color=colors, alpha=0.85)
+    ax.set_xticks(range(len(BAND_ORDER)))
+    ax.set_xticklabels(["Bad","Fair","Good","V.Good","Excep."], fontsize=9)
+    ax.set_title("Default Rate by Credit Score Band", fontweight="bold")
+    ax.set_ylabel("Default Rate (%)")
+    for bar, v in zip(bars, band_dr.values):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                f"{v:.1%}", ha="center", va="bottom", fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+
+    # 4 — default rate by purpose
+    ax = axes[1, 0]
+    purp_dr = df.groupby("purpose")["default"].mean().sort_values()
+    ax.barh(purp_dr.index, purp_dr.values * 100, color="steelblue", alpha=0.8)
+    ax.set_title("Default Rate by Loan Purpose", fontweight="bold")
+    ax.set_xlabel("Default Rate (%)");  ax.grid(axis="x", alpha=0.3)
+
+    # 5 — default rate by home ownership
+    ax = axes[1, 1]
+    home_dr = df.groupby("home_ownership")["default"].mean()
+    cols_h  = ["#1f77b4","#ff7f0e","#2ca02c"]
+    ax.bar(home_dr.index, home_dr.values * 100, color=cols_h, alpha=0.85)
+    ax.set_title("Default Rate by Home Ownership", fontweight="bold")
+    ax.set_ylabel("Default Rate (%)")
+    for i, (_, v) in enumerate(home_dr.items()):
+        ax.text(i, v * 100 + 0.2, f"{v:.1%}", ha="center", fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+
+    # 6 — correlation heatmap
+    ax = axes[1, 2]
+    corr_cols = ["loan_amount","interest_rate","annual_income","debt_to_income",
+                 "credit_score","revolving_utilization","num_derogatory_marks","default"]
+    corr = df[corr_cols].corr()
+    short = ["Loan$","IntRate","Income","DTI","CS","RevUtil","Derog","Default"]
+    im    = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(corr_cols)));  ax.set_yticks(range(len(corr_cols)))
+    ax.set_xticklabels(short, rotation=45, ha="right", fontsize=7)
+    ax.set_yticklabels(short, fontsize=7)
+    for i in range(len(corr_cols)):
+        for j in range(len(corr_cols)):
+            v = corr.values[i, j]
+            ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=5.5,
+                    color="white" if abs(v) > 0.5 else "black")
+    plt.colorbar(im, ax=ax, fraction=0.046)
+    ax.set_title("Feature Correlation Heatmap", fontweight="bold")
+
+    plt.tight_layout()
+    st.pyplot(fig);  plt.close()
+
+# ───────────────────────────────────────────────
+# TAB 2 — CREDIT RISK FACTORS
+# ───────────────────────────────────────────────
+with tab2:
+    st.header("🔬 Credit Risk Factors")
+
+    st.subheader("Key Equations")
+    st.latex(r"WoE_i = \ln\!\left(\frac{\text{Dist Events}_i}{\text{Dist Non-Events}_i}\right)")
+    st.latex(r"IV = \sum_i \!\left(\text{Events\%}_i - \text{Non-Events\%}_i\right)\times WoE_i")
+    st.latex(r"\text{Odds Ratio} = \frac{P(\text{default}=1\mid X)}{P(\text{default}=0\mid X)}")
+
+    # ── Point-biserial correlations
+    num_feats = ["loan_amount","interest_rate","annual_income","debt_to_income",
+                 "credit_score","employment_length","num_open_accounts",
+                 "num_derogatory_marks","revolving_utilization",
+                 "inquiries_last_6m","months_since_last_delinq"]
+    pb_corrs = {f: float(np.corrcoef(df[f].values, df["default"].values)[0, 1])
+                for f in num_feats}
+    pb_df = (pd.DataFrame({"Feature": list(pb_corrs.keys()),
+                            "r": list(pb_corrs.values())})
+             .sort_values("r"))
+
+    # ── WoE / IV helper
+    def woe_iv(df_in, col, target, bins=None):
+        tmp = df_in[[col, target]].copy()
+        if bins is not None:
+            tmp["bin"] = pd.cut(tmp[col], bins=bins, include_lowest=True).astype(str)
+        else:
+            tmp["bin"] = tmp[col].astype(str)
+        tot_e  = (tmp[target] == 1).sum()
+        tot_ne = (tmp[target] == 0).sum()
+        rows = []
+        for b, grp in tmp.groupby("bin"):
+            ev  = (grp[target] == 1).sum()
+            nev = (grp[target] == 0).sum()
+            de  = ev  / max(tot_e,  1)
+            dn  = nev / max(tot_ne, 1)
+            woe = np.log(max(de, 1e-9) / max(dn, 1e-9))
+            rows.append({"bin": b, "events": ev, "non_events": nev,
+                         "dist_e": de, "dist_n": dn,
+                         "woe": woe, "iv_i": (de - dn) * woe})
+        res = pd.DataFrame(rows)
+        return res, float(res["iv_i"].sum())
+
+    iv_dict = {}
+    for f in num_feats:
+        _, iv = woe_iv(df, f, "default", bins=10)
+        iv_dict[f] = iv
+    for f in ["home_ownership","purpose"]:
+        _, iv = woe_iv(df, f, "default")
+        iv_dict[f] = iv
+
+    def iv_label(v):
+        if v < 0.02:  return "Useless"
+        elif v < 0.1: return "Weak"
+        elif v < 0.3: return "Medium"
+        else:         return "Strong"
+
+    iv_df = (pd.DataFrame({"Feature": list(iv_dict.keys()), "IV": list(iv_dict.values())})
+             .sort_values("IV", ascending=False))
+    iv_df["Predictive Power"] = iv_df["IV"].apply(iv_label)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        colors_pb = ["#2ca02c" if v > 0 else "#d62728" for v in pb_df["r"]]
+        ax.barh(pb_df["Feature"], pb_df["r"], color=colors_pb, alpha=0.8)
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_title("Point-Biserial Correlation with Default", fontweight="bold")
+        ax.set_xlabel("Correlation Coefficient");  ax.grid(axis="x", alpha=0.3)
+        plt.tight_layout();  st.pyplot(fig);  plt.close()
+
+    with col2:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        iv_colors = []
+        for v in iv_df["IV"]:
+            if   v < 0.02: iv_colors.append("#d62728")
+            elif v < 0.1:  iv_colors.append("#ff7f0e")
+            elif v < 0.3:  iv_colors.append("#bcbd22")
+            else:          iv_colors.append("#2ca02c")
+        ax.barh(iv_df["Feature"], iv_df["IV"], color=iv_colors, alpha=0.85)
+        ax.axvline(0.02, color="red",    ls="--", lw=1, label="Useless/Weak 0.02")
+        ax.axvline(0.10, color="orange", ls="--", lw=1, label="Weak/Medium 0.10")
+        ax.axvline(0.30, color="green",  ls="--", lw=1, label="Medium/Strong 0.30")
+        ax.set_title("Information Value (IV) by Feature", fontweight="bold")
+        ax.set_xlabel("IV");  ax.legend(fontsize=7);  ax.grid(axis="x", alpha=0.3)
+        plt.tight_layout();  st.pyplot(fig);  plt.close()
+
+    st.dataframe(iv_df.reset_index(drop=True), use_container_width=True)
+
+    # ── WoE binning chart for credit_score
+    st.subheader("WoE Binning — Credit Score")
+    cs_woe, cs_iv = woe_iv(df, "credit_score", "default", bins=10)
+    cs_woe = cs_woe.sort_values("bin")
+
+    # ── KS statistic
+    sc_all    = predict_pd(df, mdl)
+    y_all     = df["default"].values
+    order_ks  = np.argsort(sc_all)
+    ys_ks     = y_all[order_ks]
+    cum_pos_ks = np.cumsum(ys_ks)      / max(ys_ks.sum(), 1)
+    cum_neg_ks = np.cumsum(1 - ys_ks) / max((1 - ys_ks).sum(), 1)
+    ks_val    = float(np.max(np.abs(cum_pos_ks - cum_neg_ks)))
+    x_axis    = np.linspace(0, 1, len(order_ks))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    ax = axes[0]
+    woe_colors = ["#2ca02c" if w >= 0 else "#d62728" for w in cs_woe["woe"]]
+    ax.bar(range(len(cs_woe)), cs_woe["woe"], color=woe_colors, alpha=0.8)
+    ax.set_xticks(range(len(cs_woe)))
+    ax.set_xticklabels(cs_woe["bin"], rotation=45, ha="right", fontsize=7)
+    ax.set_title(f"WoE by Credit Score Bin  (IV={cs_iv:.3f})", fontweight="bold")
+    ax.set_ylabel("Weight of Evidence");  ax.axhline(0, color="black", lw=0.8)
+    ax.grid(axis="y", alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(x_axis, cum_pos_ks, color="crimson",   lw=2, label="Defaulters CDF")
+    ax.plot(x_axis, cum_neg_ks, color="steelblue", lw=2, label="Non-Defaulters CDF")
+    ks_idx = int(np.argmax(np.abs(cum_pos_ks - cum_neg_ks)))
+    ax.axvline(x_axis[ks_idx], color="gray", ls="--", lw=1.5, label=f"KS={ks_val:.4f}")
+    ax.fill_between(x_axis, cum_pos_ks, cum_neg_ks, alpha=0.1, color="gray")
+    ax.set_title("KS Statistic — Score Separation", fontweight="bold")
+    ax.set_xlabel("Population Percentile");  ax.set_ylabel("Cumulative Distribution")
+    ax.legend();  ax.grid(alpha=0.3)
+
+    plt.tight_layout();  st.pyplot(fig);  plt.close()
+    st.info(f"KS = **{ks_val:.4f}**  |  KS > 0.3 = good  |  KS > 0.4 = excellent")
+
+# ───────────────────────────────────────────────
+# TAB 3 — MODEL TRAINING & SCORECARD
+# ───────────────────────────────────────────────
+with tab3:
+    st.header("🤖 Model Training & Scorecard")
+
+    st.subheader("Logistic Regression via SGD")
+    st.latex(r"P(\text{default}=1\mid\mathbf{x}) = \sigma(\mathbf{w}^\top\mathbf{x}+b)"
+             r"= \frac{1}{1+e^{-(\mathbf{w}^\top\mathbf{x}+b)}}")
+    st.latex(r"\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}w_i"
+             r"\bigl[y_i\log\hat{p}_i+(1-y_i)\log(1-\hat{p}_i)\bigr]"
+             r"+\frac{\lambda}{2}\|\mathbf{w}\|^2")
+
+    m_cols = st.columns(6)
+    m_cols[0].metric("ROC-AUC",    f"{mdl['auc']:.4f}")
+    m_cols[1].metric("PR-AUC",     f"{mdl['prauc']:.4f}")
+    m_cols[2].metric("Log Loss",   f"{mdl['ll']:.4f}")
+    m_cols[3].metric("KS Stat",    f"{mdl['ks']:.4f}")
+    m_cols[4].metric("Gini",       f"{mdl['gini']:.4f}")
+    m_cols[5].metric("Brier Score",f"{mdl['brier']:.4f}")
+
+    fig = plt.figure(figsize=(16, 10))
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+    # ROC
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(mdl["fpr"], mdl["tpr"], color="crimson", lw=2,
+             label=f"AUC={mdl['auc']:.3f}")
+    ax1.plot([0,1],[0,1],"k--",lw=1, label="Random")
+    ax1.fill_between(mdl["fpr"], mdl["tpr"], alpha=0.12, color="crimson")
+    ax1.set_title("ROC Curve", fontweight="bold")
+    ax1.set_xlabel("FPR");  ax1.set_ylabel("TPR")
+    ax1.legend(fontsize=9);  ax1.grid(alpha=0.3)
+
+    # PR
+    ax2 = fig.add_subplot(gs[0, 1])
+    baseline = mdl["y_te"].mean()
+    ax2.plot(mdl["rec"], mdl["prec"], color="steelblue", lw=2,
+             label=f"AUC={mdl['prauc']:.3f}")
+    ax2.axhline(baseline, color="gray", ls="--", lw=1,
+                label=f"Baseline={baseline:.2f}")
+    ax2.set_title("Precision-Recall Curve", fontweight="bold")
+    ax2.set_xlabel("Recall");  ax2.set_ylabel("Precision")
+    ax2.legend(fontsize=9);  ax2.grid(alpha=0.3)
+
+    # Score distribution
+    ax3 = fig.add_subplot(gs[0, 2])
+    s0 = mdl["sc_te"][mdl["y_te"]==0]
+    s1 = mdl["sc_te"][mdl["y_te"]==1]
+    ax3.hist(s0, bins=50, alpha=0.6, color="steelblue", density=True, label="Non-Default")
+    ax3.hist(s1, bins=50, alpha=0.6, color="crimson",   density=True, label="Default")
+    ax3.axvline(threshold, color="black", ls="--", lw=1.5, label=f"t={threshold}")
+    ax3.set_title("Score Distribution (Test)", fontweight="bold")
+    ax3.set_xlabel("Predicted PD");  ax3.set_ylabel("Density")
+    ax3.legend(fontsize=9);  ax3.grid(alpha=0.3)
+
+    # Calibration
+    ax4 = fig.add_subplot(gs[1, 0])
+    edges = np.linspace(0, 1, 11)
+    frac_pos_cal, mean_pred_cal = [], []
+    for i in range(10):
+        mask = (mdl["sc_te"] >= edges[i]) & (mdl["sc_te"] < edges[i+1])
+        if mask.sum() > 0:
+            frac_pos_cal.append(mdl["y_te"][mask].mean())
+            mean_pred_cal.append(mdl["sc_te"][mask].mean())
+    ax4.plot([0,1],[0,1],"k--",lw=1, label="Perfect")
+    ax4.plot(mean_pred_cal, frac_pos_cal, "o-", color="steelblue", lw=2, label="Model")
+    ax4.set_title("Calibration Curve", fontweight="bold")
+    ax4.set_xlabel("Mean Predicted PD");  ax4.set_ylabel("Fraction Positive")
+    ax4.legend(fontsize=9);  ax4.grid(alpha=0.3)
+
+    # Confusion matrix
+    ax5 = fig.add_subplot(gs[1, 1])
+    preds = (mdl["sc_te"] >= threshold).astype(int)
+    tp = int(((preds==1)&(mdl["y_te"]==1)).sum())
+    fp = int(((preds==1)&(mdl["y_te"]==0)).sum())
+    tn = int(((preds==0)&(mdl["y_te"]==0)).sum())
+    fn = int(((preds==0)&(mdl["y_te"]==1)).sum())
+    cm = np.array([[tn,fp],[fn,tp]])
+    ax5.imshow(cm, cmap="Blues")
+    ax5.set_xticks([0,1]); ax5.set_yticks([0,1])
+    ax5.set_xticklabels(["Pred: No","Pred: Yes"], fontsize=9)
+    ax5.set_yticklabels(["Act: No","Act: Yes"],  fontsize=9)
+    for i in range(2):
+        for j in range(2):
+            ax5.text(j, i, str(cm[i,j]), ha="center", va="center", fontsize=13,
+                     color="white" if cm[i,j] > cm.max()/2 else "black")
+    prec_cm = tp / max(tp+fp, 1);  rec_cm = tp / max(tp+fn, 1)
+    ax5.set_title(f"Confusion Matrix  t={threshold:.2f}\nPrec={prec_cm:.2f}  Rec={rec_cm:.2f}",
+                  fontweight="bold")
+
+    # Basel info panel
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis("off")
+    pd_b3 = pd_manual if pd_override else dr_mean
+    R_b3 = (0.12*(1-np.exp(-50*pd_b3))/(1-np.exp(-50))
+            + 0.24*(1-(1-np.exp(-50*pd_b3))/(1-np.exp(-50))))
+    K_b3 = (lgd * sp_norm.cdf(
+        np.sqrt(1/(1-R_b3))*sp_norm.ppf(pd_b3)
+        + np.sqrt(R_b3/(1-R_b3))*sp_norm.ppf(0.999)
+    ) - pd_b3 * lgd)
+    mean_ead = df["loan_amount"].mean() * ead_mult
+    rwa_b3   = K_b3 * 12.5 * mean_ead
+    lines = [
+        f"PD  = {pd_b3:.3%}",
+        f"LGD = {lgd:.0%}",
+        f"R   = {R_b3:.4f}",
+        f"K   = {K_b3:.4f}",
+        f"RWA = ${rwa_b3:,.0f}",
+        f"EL  = ${pd_b3*lgd*mean_ead:,.0f}",
     ]
-    for i, (name, desc) in enumerate(tech_stack):
-        with stack_cols[i % 4]:
-            st.markdown(f"**{name}**  \n{desc}")
+    for i, ln in enumerate(lines):
+        ax6.text(0.05, 0.85 - i*0.14, ln, transform=ax6.transAxes, fontsize=10,
+                 fontfamily="monospace")
+    ax6.set_title("Basel III IRB Summary", fontweight="bold")
 
-    st.markdown("---")
-    st.markdown("### About This Project")
-    st.markdown(
-        "**DefaultRisk** is an end-to-end machine learning case study focused on Probability of Default (PD) "
-        "modeling for credit card portfolios in the Indian banking context. The project demonstrates:"
-    )
-    st.markdown("""
-    - **Technical depth:** leak-free pipelines, statistical testing, SHAP explainability
-    - **Business alignment:** cost-sensitive thresholds, gain/lift charts, scorecard visualization
-    - **Regulatory awareness:** RBI Basel III framework, model documentation, monitoring plans
-    - **Engineering rigour:** sklearn pipelines, graceful fallbacks, self-contained app
+    plt.tight_layout();  st.pyplot(fig);  plt.close()
 
-    Designed for data science and ML engineering roles in banking and fintech.
-    """)
+    st.subheader("Basel III IRB Capital Formulae")
+    st.latex(r"R = 0.12\,\frac{1-e^{-50\,PD}}{1-e^{-50}}"
+             r"+ 0.24\!\left(1-\frac{1-e^{-50\,PD}}{1-e^{-50}}\right)")
+    st.latex(r"K = LGD\cdot N\!\left[\sqrt{\frac{1}{1-R}}\,G(PD)"
+             r"+\sqrt{\frac{R}{1-R}}\,G(0.999)\right]-PD\cdot LGD")
+    st.latex(r"EL = PD\times LGD\times EAD")
+    st.latex(r"RWA = K\times 12.5\times EAD")
 
-    st.markdown("---")
-    st.markdown(
-        "<div class='footer'>"
-        "DefaultRisk v1.0  \u00b7  Built with Streamlit  \u00b7  "
-        f"Dataset: {st.session_state.dataset_name}  \u00b7  "
-        f"Last updated: {datetime.now().strftime('%B %Y')}"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+# ───────────────────────────────────────────────
+# TAB 4 — SCORECARD & SCOREPOINTS
+# ───────────────────────────────────────────────
+with tab4:
+    st.header("📋 Scorecard & Scorepoints")
 
+    BASE_SCORE = 600;  PDO = 20
+    st.latex(r"\text{Score}_i = \left(\beta_i X_i+\frac{\alpha}{n}\right)"
+             r"\times\frac{PDO}{\ln 2}+\frac{\text{Base Score}}{n}")
+    st.latex(r"\text{Total Score}=\sum_{i=1}^{n}\text{Score}_i"
+             r"\quad (\text{Base}=600,\;PDO=20)")
 
-st.sidebar.markdown("---")
-if st.session_state.data_loaded:
-    ds_short = st.session_state.dataset_name.split("(")[0].strip()
-    st.sidebar.caption(
-        f"\U0001f3e6 DefaultRisk v1.0  \n"
-        f"{ds_short}  \n"
-        f"\U0001f4ca {len(df):,} rows  \u00b7  {int(df['Class'].sum())} defaults"
-    )
-else:
-    st.sidebar.caption("\U0001f3e6 DefaultRisk v1.0  \u00b7  Built with Python + Streamlit")
+    scale    = PDO / np.log(2)
+    n_f      = len(mdl["feat_names"])
+    coefs    = mdl["w"]
+    score_pts = coefs * scale
+
+    sc_tbl = pd.DataFrame({
+        "Feature":                  mdl["feat_names"],
+        "Coefficient":              coefs.round(5),
+        "Score Points (per sigma)": score_pts.round(2),
+        "Direction": ["Increases Risk" if c > 0 else "Decreases Risk" for c in coefs],
+    }).sort_values("Score Points (per sigma)", key=abs, ascending=False)
+    st.subheader("Scorecard Coefficient Table")
+    st.dataframe(sc_tbl, use_container_width=True)
+
+    # Scaled scores for full portfolio
+    X_all_s4, _ = build_X(df)
+    Xs_s4       = (X_all_s4 - mdl["mu"]) / mdl["sd"]
+    raw_logit   = Xs_s4 @ mdl["w"] + mdl["b"]
+    scaled_sc   = BASE_SCORE + raw_logit * scale
+    df["scaled_score"] = scaled_sc
+
+    band_edges  = [300, 450, 525, 575, 625, 675, 750, 900]
+    band_labels = ["<450","450-525","525-575","575-625","625-675","675-750",">750"]
+    df["score_band"] = pd.cut(df["scaled_score"], bins=band_edges,
+                               labels=band_labels, include_lowest=True)
+
+    score_band_df = df.groupby("score_band", observed=False).agg(
+        Count=("default","count"),
+        Default_Rate=("default","mean"),
+        Avg_Score=("scaled_score","mean"),
+    ).reset_index()
+    score_band_df["Risk_Tier"] = score_band_df["Default_Rate"].apply(
+        lambda x: "High Risk" if x > 0.25 else ("Medium Risk" if x > 0.10 else "Low Risk"))
+    score_band_df["Decision"] = score_band_df["Risk_Tier"].map(
+        {"High Risk":"DECLINE","Medium Risk":"REVIEW","Low Risk":"APPROVE"})
+
+    st.subheader("Score Band Analysis")
+    st.dataframe(score_band_df.round(4), use_container_width=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    ax = axes[0]
+    ax.hist(scaled_sc[df["default"].values==0], bins=60, alpha=0.6,
+            color="steelblue", density=True, label="Non-Default")
+    ax.hist(scaled_sc[df["default"].values==1], bins=60, alpha=0.6,
+            color="crimson",   density=True, label="Default")
+    ax.set_title("Scorecard Score Distribution", fontweight="bold")
+    ax.set_xlabel("Credit Score");  ax.set_ylabel("Density")
+    ax.legend();  ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    valid = score_band_df.dropna(subset=["score_band"])
+    band_colors = ["#d62728" if t=="High Risk" else ("#ff7f0e" if t=="Medium Risk" else "#2ca02c")
+                   for t in valid["Risk_Tier"]]
+    ax.bar(range(len(valid)), valid["Default_Rate"]*100, color=band_colors, alpha=0.85)
+    ax.set_xticks(range(len(valid)))
+    ax.set_xticklabels(valid["score_band"].astype(str), rotation=30, ha="right")
+    ax.set_title("Default Rate by Score Band", fontweight="bold")
+    ax.set_ylabel("Default Rate (%)");  ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout();  st.pyplot(fig);  plt.close()
+
+    # Application Scoring Simulator
+    st.subheader("Application Scoring Simulator")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sim_loan   = st.slider("Loan Amount ($K)", 5, 500, 25) * 1_000
+        sim_rate   = st.slider("Interest Rate (%)", 5.0, 36.0, 12.0)
+        sim_term   = st.selectbox("Term (months)", [36, 60])
+        sim_income = st.slider("Annual Income ($K)", 20, 300, 65) * 1_000
+        sim_dti    = st.slider("Debt-to-Income", 0.01, 0.99, 0.25)
+    with c2:
+        sim_cs     = st.slider("Credit Score", 300, 850, 680)
+        sim_emp    = st.slider("Employment Length (yrs)", 0, 20, 5)
+        sim_open   = st.slider("Num Open Accounts", 1, 40, 10)
+        sim_derog  = st.slider("Derogatory Marks", 0, 5, 0)
+    with c3:
+        sim_revutil= st.slider("Revolving Utilization", 0.0, 1.0, 0.30)
+        sim_inq    = st.slider("Inquiries Last 6M", 0, 10, 1)
+        sim_delinq = st.slider("Months Since Last Delinq (0=never)", 0, 120, 0)
+        sim_home   = st.selectbox("Home Ownership", ["RENT","OWN","MORTGAGE"])
+        sim_purp   = st.selectbox("Loan Purpose",
+                                  ["car","debt_consolidation","home","medical","business","vacation"])
+
+    sim_vec = np.array([[
+        sim_loan, sim_rate, float(sim_term), sim_income, sim_dti,
+        float(sim_cs), float(sim_emp), float(sim_open), float(sim_derog),
+        sim_revutil, float(sim_inq), float(sim_delinq),
+        1.0 if sim_home=="OWN"      else 0.0,
+        1.0 if sim_home=="MORTGAGE" else 0.0,
+        1.0 if sim_purp=="debt_consolidation" else 0.0,
+        1.0 if sim_purp=="business" else 0.0,
+    ]])
+    sim_Xs      = (sim_vec - mdl["mu"]) / mdl["sd"]
+    sim_raw     = float(sim_Xs @ mdl["w"] + mdl["b"])
+    sim_pd_val  = float(sigmoid(np.array([sim_raw]))[0])
+    sim_score_v = BASE_SCORE + sim_raw * scale
+    sim_el      = sim_pd_val * lgd * sim_loan * ead_mult
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Credit Score",    f"{sim_score_v:.0f}")
+    r2.metric("Predicted PD",    f"{sim_pd_val:.2%}")
+    r3.metric("Expected Loss",   f"${sim_el:,.0f}")
+    if   sim_pd_val < 0.10: r4.success("APPROVE")
+    elif sim_pd_val < 0.25: r4.warning("REVIEW")
+    else:                   r4.error("DECLINE")
+
+    st.subheader("Population Stability Index (PSI)")
+    st.latex(r"PSI = \sum_{i=1}^{n}\!\left(\text{Actual\%}_i - \text{Expected\%}_i\right)"
+             r"\times\ln\!\left(\frac{\text{Actual\%}_i}{\text{Expected\%}_i}\right)")
+    st.info("PSI < 0.1: Stable  |  0.1-0.2: Moderate shift  |  > 0.2: Major shift — model review required")
+
+# ───────────────────────────────────────────────
+# TAB 5 — PORTFOLIO RISK & CAPITAL
+# ───────────────────────────────────────────────
+with tab5:
+    st.header("💰 Portfolio Risk & Capital")
+
+    st.latex(r"EL = PD\times LGD\times EAD")
+    st.latex(r"UL_i = EAD_i\times LGD_i\times\sqrt{PD_i(1-PD_i)}")
+    st.latex(r"\text{Economic Capital}=VaR_{99.9\%}(\text{Portfolio Loss})-EL")
+    st.latex(r"RAROC=\frac{\text{Revenue}-EL-\text{OpCost}}{\text{Economic Capital}}")
+
+    # per-loan metrics
+    ul_all       = loan_ead_all * lgd * np.sqrt(loan_pd_all * (1 - loan_pd_all))
+    total_ul     = ul_all.sum()
+    port_size    = loan_ead_all.sum()
+
+    # Monte Carlo (500 sims on 2k loan sample)
+    rng_mc  = np.random.default_rng(123)
+    samp_n  = min(2_000, len(df))
+    samp_idx= rng_mc.choice(len(df), samp_n, replace=False)
+    s_pd    = loan_pd_all[samp_idx]
+    s_ead   = loan_ead_all[samp_idx]
+    scale_up= len(df) / samp_n
+
+    sim_losses = np.array([
+        (rng_mc.random(samp_n) < s_pd).astype(float) @ (s_ead * lgd) * scale_up
+        for _ in range(500)
+    ])
+
+    var_99  = np.percentile(sim_losses, 99.0)
+    var_999 = np.percentile(sim_losses, 99.9)
+    cvar_99 = sim_losses[sim_losses >= var_99].mean()
+    ec_val  = max(var_999 - total_el, 0)
+
+    rev_t5  = (df["loan_amount"] * df["interest_rate"] / 100 * (df["term"]/12)).sum() * 0.8
+    opc_t5  = rev_t5 * 0.25
+    raroc_t5= (rev_t5 - total_el - opc_t5) / max(ec_val, 1)
+
+    r_cols = st.columns(5)
+    r_cols[0].metric("Total EL ($)",       f"${total_el:,.0f}")
+    r_cols[1].metric("Total UL ($)",       f"${total_ul:,.0f}")
+    r_cols[2].metric("VaR 99.9% ($)",      f"${var_999:,.0f}")
+    r_cols[3].metric("Economic Capital ($)",f"${ec_val:,.0f}")
+    r_cols[4].metric("RAROC",              f"{raroc_t5:.2%}")
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+    # Monte Carlo loss distribution
+    ax = axes[0, 0]
+    ax.hist(sim_losses / 1e6, bins=50, color="steelblue", alpha=0.8, edgecolor="white")
+    ax.axvline(total_el / 1e6, color="green",  ls="-",  lw=2, label=f"EL ${total_el/1e6:.1f}M")
+    ax.axvline(var_99   / 1e6, color="orange", ls="--", lw=2, label=f"VaR 99% ${var_99/1e6:.1f}M")
+    ax.axvline(var_999  / 1e6, color="red",    ls="--", lw=2, label=f"VaR 99.9% ${var_999/1e6:.1f}M")
+    ax.set_title("Monte Carlo Loss Distribution (500 sims)", fontweight="bold")
+    ax.set_xlabel("Portfolio Loss ($M)");  ax.set_ylabel("Frequency")
+    ax.legend(fontsize=8);  ax.grid(alpha=0.3)
+
+    # EL per loan
+    ax = axes[0, 1]
+    ax.hist(el_all / 1_000, bins=60, color="crimson", alpha=0.75, edgecolor="white")
+    ax.set_title("Expected Loss per Loan", fontweight="bold")
+    ax.set_xlabel("EL ($K)");  ax.set_ylabel("Count");  ax.grid(alpha=0.3)
+
+    # PD distribution
+    ax = axes[0, 2]
+    ax.hist(loan_pd_all, bins=60, color="darkorange", alpha=0.75, edgecolor="white")
+    ax.axvline(loan_pd_all.mean(), color="red", ls="--", lw=2,
+               label=f"Mean PD={loan_pd_all.mean():.2%}")
+    ax.set_title("Model PD Distribution", fontweight="bold")
+    ax.set_xlabel("Predicted PD");  ax.set_ylabel("Count")
+    ax.legend(fontsize=9);  ax.grid(alpha=0.3)
+
+    # Vintage analysis
+    ax = axes[1, 0]
+    cohorts  = [f"2019-Q{i}" for i in range(1, 7)]
+    rng_v    = np.random.default_rng(99)
+    cohort_dr= [dr_mean * rng_v.uniform(0.7, 1.4) for _ in cohorts]
+    bar_cols = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, 6))
+    ax.bar(cohorts, [d*100 for d in cohort_dr], color=bar_cols, alpha=0.85)
+    ax.set_title("Vintage Analysis — Default Rate by Cohort", fontweight="bold")
+    ax.set_xlabel("Origination Cohort");  ax.set_ylabel("Default Rate (%)")
+    ax.tick_params(axis="x", rotation=30);  ax.grid(axis="y", alpha=0.3)
+
+    # Stress test
+    ax = axes[1, 1]
+    X_stress, _ = build_X(df)
+    Xs_stress   = (X_stress - mdl["mu"]) / mdl["sd"]
+    logit_base  = Xs_stress @ mdl["w"] + mdl["b"]
+    cs_feat_idx = mdl["feat_names"].index("credit_score")
+    shock       = -50.0 / (mdl["sd"][cs_feat_idx] + 1e-8)
+    logit_str   = logit_base + mdl["w"][cs_feat_idx] * shock
+    pd_str      = sigmoid(logit_str)
+    if pd_override: pd_str = np.full(len(df), min(pd_manual * 1.3, 0.999))
+    el_str      = (pd_str * lgd * loan_ead_all).sum()
+
+    cats = ["Current", "Stressed\n(-50pt CS)"]
+    vals = [total_el / 1e6, el_str / 1e6]
+    bcol = ["#2ca02c","#d62728"]
+    bars_st = ax.bar(cats, vals, color=bcol, alpha=0.85, width=0.4)
+    for bar, v in zip(bars_st, vals):
+        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.02,
+                f"${v:.1f}M", ha="center", va="bottom", fontsize=10)
+    ax.set_title("Stress Test — CS Drop 50 Points", fontweight="bold")
+    ax.set_ylabel("Portfolio EL ($M)");  ax.grid(axis="y", alpha=0.3)
+
+    # Regulatory capital table
+    ax = axes[1, 2]
+    ax.axis("off")
+    PD_reg = loan_pd_all.mean()
+    R_reg  = (0.12*(1-np.exp(-50*PD_reg))/(1-np.exp(-50))
+               + 0.24*(1-(1-np.exp(-50*PD_reg))/(1-np.exp(-50))))
+    K_reg  = (lgd * sp_norm.cdf(
+        np.sqrt(1/(1-R_reg))*sp_norm.ppf(PD_reg)
+        + np.sqrt(R_reg/(1-R_reg))*sp_norm.ppf(0.999)
+    ) - PD_reg * lgd)
+    RWA_reg  = K_reg * 12.5 * port_size
+    Tier1    = RWA_reg * 0.06
+    Tier2    = RWA_reg * 0.02
+    TotCap   = Tier1 + Tier2
+
+    tbl_data = [
+        ["Portfolio EAD",   f"${port_size/1e6:.1f}M"],
+        ["Mean PD",         f"{PD_reg:.2%}"],
+        ["LGD",             f"{lgd:.0%}"],
+        ["Correl. R",       f"{R_reg:.4f}"],
+        ["Capital K",       f"{K_reg:.4f}"],
+        ["RWA",             f"${RWA_reg/1e6:.1f}M"],
+        ["Tier 1 (6%)",     f"${Tier1/1e6:.1f}M"],
+        ["Tier 2 (2%)",     f"${Tier2/1e6:.1f}M"],
+        ["Total Capital",   f"${TotCap/1e6:.1f}M"],
+        ["Econ. Capital",   f"${ec_val/1e6:.2f}M"],
+        ["RAROC",           f"{raroc_t5:.2%}"],
+    ]
+    tbl = ax.table(cellText=tbl_data, colLabels=["Metric","Value"],
+                   cellLoc="center", loc="center", bbox=[0, 0, 1, 1])
+    tbl.auto_set_font_size(False);  tbl.set_fontsize(9)
+    for (row, col), cell in tbl.get_celld().items():
+        if row == 0:
+            cell.set_facecolor("#2c3e50");  cell.set_text_props(color="white", fontweight="bold")
+        elif row % 2 == 0:
+            cell.set_facecolor("#f0f0f0")
+        cell.set_edgecolor("#cccccc")
+    ax.set_title("Regulatory Capital Summary", fontweight="bold", pad=10)
+
+    plt.tight_layout();  st.pyplot(fig);  plt.close()
+
+    st.subheader("Regulatory Capital Ratios")
+    st.latex(r"\text{Tier 1 Ratio} = \frac{\text{Tier 1 Capital}}{RWA} \geq 6\%")
+    st.latex(r"\text{Total Capital Ratio} = \frac{\text{Tier 1}+\text{Tier 2}}{RWA} \geq 8\%")
+
+    reg_df = pd.DataFrame({
+        "Metric": [r[0] for r in tbl_data],
+        "Value":  [r[1] for r in tbl_data],
+    })
+    st.dataframe(reg_df, use_container_width=True)
+
+st.markdown("---")
+st.caption("DefaultRisk  |  Basel III / LendingClub Framing  |  Pure NumPy  |  Synthetic Data Only")

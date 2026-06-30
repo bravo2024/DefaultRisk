@@ -1,12 +1,9 @@
+# --- core (pinned, required to run) ---
 numpy>=1.26
-pandas>=1.5
 scikit-learn>=1.3
 streamlit>=1.30
 matplotlib>=3.7
-seaborn>=0.13
-scipy>=1.10
-plotly>=5.15
-lightgbm>=4.0
-shap>=0.44
-ucimlrepo>=0.0.7
-empulse>=0.11
+
+# --- optional: production-grade upgrades (uncomment to enable) ---
+# lightgbm>=4.0
+# shap>=0.44
